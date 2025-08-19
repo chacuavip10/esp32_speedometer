@@ -779,7 +779,7 @@ static void updateScreen()
 // =============== Setup ===============
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(38400);
 
   Wire.begin(21, 22);
   Wire.setClock(400000);
