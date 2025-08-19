@@ -791,6 +791,10 @@ void setup()
       delay(1000);
   }
   display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(4);
+  display.setCursor(0, 14);
+  display.print("SETUP");
   display.display();
 
   pinMode(PIN_BUTTON, INPUT_PULLDOWN);
@@ -865,11 +869,17 @@ void setup()
     GPS.end();
     delay(80);
   }
-
   GPS.begin(TARGET_BAUD, SERIAL_8N1, PIN_RXD2, PIN_TXD2);
 
   Serial.println(F("Setup complete. Speedometer should start now!"));
   Serial.println(F("===================================================="));
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(4);
+  display.setCursor(0, 14);
+  display.print("START");
+  display.display();
+  delay(500);
   lastMaxLoopResetMs = millis();
 }
 
