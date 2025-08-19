@@ -805,7 +805,7 @@ void setup()
     Serial.printf(">>> Current GPS baudrate: %d\n", CURRENT_BAUD_RATE);
   else
     Serial.println("!!! Cannot detect GPS baudrate (no valid UBX/NMEA on known rates).");
-  if (CURRENT_BAUD_RATE == 38400)
+  if (CURRENT_BAUD_RATE == 115200)
   {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -868,7 +868,7 @@ void setup()
     // ENABLE NAV_PVT
     sendWithAckLog(UBX_NAV_PVT_UART1_ON, 0x06, 0x8a, "UBX_NAV_PVT_UART1_ON", 1000);
 
-    sendWithAckLog(CFG_NAVSPG_DYNMODEL_AUTOMOTIVE, 0x06, 0x8a, "CFG_NAVSPG_DYNMODEL_AUTOMOTIVE", 1000);
+    sendWithAckLog(CFG_NAVSPG_DYNMODEL_AUTOMOTIVE, 0x06, 0x8a, "DYNMODEL_AUTOMOTIVE", 1000);
 
     // 10 Hz rate
     sendWithAckLog(CFG_RATE_MEAS_10Hz, 0x06, 0x8a, "CFG_RATE_MEAS_10Hz", 1000);
