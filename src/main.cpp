@@ -779,7 +779,7 @@ static void updateScreen()
 // =============== Setup ===============
 void setup()
 {
-  Serial.begin(38400);
+  Serial.begin(115200);
 
   Wire.begin(21, 22);
   Wire.setClock(400000);
@@ -805,7 +805,7 @@ void setup()
     Serial.printf(">>> Current GPS baudrate: %d\n", CURRENT_BAUD_RATE);
   else
     Serial.println("!!! Cannot detect GPS baudrate (no valid UBX/NMEA on known rates).");
-  if (CURRENT_BAUD_RATE == 115200)
+  if (CURRENT_BAUD_RATE == 38400)
   {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
