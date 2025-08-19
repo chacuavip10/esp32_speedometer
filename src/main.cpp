@@ -8,7 +8,7 @@
  * - 24-hour clamp for local time display
  */
 
-#define DEBUG_PROFILE 1 // enable Serial log for maxLoopMs (always prints when
+#define DEBUG_PROFILE 1 // enable Serial log for maxLoopMs_last5s (always prints when
                         // enabled)
 #define UBX_ACK_DEBUG 1 // 1 = log ACK checksum / class-id mismatches
 #define SHOW_CLOCK 0
@@ -632,7 +632,8 @@ int getEffectiveCalibrationOffset(float speedKmh, int rawOffset)
 // =============== App variables ===============
 int speedCalibrationOffset = 0; // km/h offset (0..5)
 unsigned long lastScreenUpdateMs = 0;
-unsigned long maxLoopMs = 0;
+unsigned long maxLoopMs_last5s = 0;
+unsigned long lastMaxLoopResetMs = 0; // NEW: mốc reset maxLoopMs_last5s mỗi 5s
 String speedoText = "kmh";
 
 // =============== Display render ===============
@@ -741,6 +742,8 @@ static void updateScreen()
     display.print("LOST");
   else if (pvt.fixType < 2)
     display.print("---");
+  else if ((float)pvt.sAcc > 0.2f * (float)pvt.gSpeed)
+    display.print("..."); // Speed not reliable
   else
   {
     speedCalc = mmps_to_kmh(pvt.gSpeed);
@@ -766,9 +769,9 @@ static void updateScreen()
     // TODO: Apply smoothing here - Accuracy-gated Zero Filter - Deadband Filter + timeout
   }
 
-  // display.setTextSize(1);
-  // display.setCursor(110, 40);
-  // display.print(maxLoopMs);
+  display.setTextSize(1);
+  display.setCursor(110, 40);
+  display.print(maxLoopMs_last5s);
 
   display.display();
 }
@@ -867,6 +870,7 @@ void setup()
 
   Serial.println(F("Setup complete. Speedometer should start now!"));
   Serial.println(F("===================================================="));
+  lastMaxLoopResetMs = millis();
 }
 
 // =============== Loop ===============
@@ -901,8 +905,8 @@ void loop()
     navPvtCountLastSec = navPvtCountPerSec;
     navPvtCountPerSec = 0;
 #ifdef DEBUG_PROFILE
-    Serial.print(F("maxLoopMs: "));
-    Serial.println(maxLoopMs);
+    Serial.print(F("maxLoopMs_last5s: "));
+    Serial.println(maxLoopMs_last5s);
     Serial.printf("[PVT] %u valid NAV-PVT msgs/sec\n", navPvtCountLastSec);
     Serial.println("---------");
 #endif
@@ -923,10 +927,15 @@ void loop()
     spinnerScreenPos = (spinnerScreenPos + 1) % 4;
   }
 
-  // Update maxLoopMs and always print when DEBUG_PROFILE is enabled
-  unsigned long loopTime = millis() - t0;
-  if (loopTime > maxLoopMs)
+  if (now - lastMaxLoopResetMs >= 5000)
   {
-    maxLoopMs = loopTime;
+    maxLoopMs_last5s = 0;
+    lastMaxLoopResetMs = now;
+  }
+  // Update maxLoopMs_last5s and always print when DEBUG_PROFILE is enabled
+  unsigned long loopTime = millis() - t0;
+  if (loopTime > maxLoopMs_last5s)
+  {
+    maxLoopMs_last5s = loopTime;
   }
 }

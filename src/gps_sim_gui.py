@@ -11,13 +11,14 @@ Key features:
 - Start enabled only when Port & Baudrate are set and at least one message is selected
 - Apply-to-running resets sim and applies changes (including update rate); button lights only when settings changed
 - Profiles with linear speed ramp; NO_FIX and GPS_DISABLE special modes
-- Active profile shown inside Profile settings; progress bar turns gray in NO_FIX/GPS_DISABLE
-- Status area with fixed columns; Speed standout line; FIX text color-coded:
+- Active profile shown inside Profile settings; 60fps smoothed progress bar (gray in NO_FIX/GPS_DISABLE)
+- Status area with fixed columns; Speed standout line; FIX text as:
     * "3D FIX" (green) for fix=3, "2D FIX" (green) for fix=2, "NO FIX" (red) otherwise
     * "GPS DISABLED" (gray) in GPS_DISABLE profile
     * In NO_FIX or GPS_DISABLE, numeric metrics show as "______"
+    * In GPS_DISABLE the entire status area turns gray
 - Message settings:
-    * Update rate (Hz)
+    * Update rate (Hz) (applies on Apply-to-running)
     * Master checkboxes (Enable UBX / Enable NMEA) aligned with child checkboxes (3-column layout)
     * Actual send rate per message (UBX + NMEA)
 - TX Monitor lists latest UBX (hex, full) and NMEA (text) per enabled message; right-click to copy
@@ -660,8 +661,9 @@ class SimulatorGUI:
 
         # Colors
         self.col_green = "#2e7d32"
-        self.col_red = "#c62828"
-        self.col_gray = "#9e9e9e"
+        self.col_red   = "#c62828"
+        self.col_gray  = "#9e9e9e"
+        self.col_text  = "#000000"   # default text color for status area
 
         # Queues
         self.rate_queue = queue.Queue()
@@ -682,6 +684,13 @@ class SimulatorGUI:
         # Profile tracking
         self._current_profile_name = "—"
         self._current_is_lost = False
+
+        # Progressbar smoothing (60fps)
+        self._prog_value = 0.0      # current 0..1
+        self._prog_target = 0.0     # target 0..1
+        self._prog_last_t = time.perf_counter()
+        self._prog_alpha_per_s = 6.0  # higher = snappier
+        self.root.after(16, self._animate_progress)  # start 60fps animator
 
         # --- Top bar: Port + Baud ---
         top = ttk.Frame(root, padding=8)
@@ -846,7 +855,7 @@ class SimulatorGUI:
             ("CITY_DRIVING", True, 10, 60, 5.0, False),
             ("HIGHWAY_DRIVING", True, 60, 100, 5.0, False),
             ("HIGH_SPEED", True, 100, 399, 5.0, False),
-            ("NO_FIX", True, -1, -1, 10.0, True),
+            ("NO_FIX", True, -1, -1, 5.0, True),
             ("GPS_DISABLE", True, -2, -2, 10.0, True),
         ]
         for i, (n, e, mn, mx, du, lock) in enumerate(rows, start=1):
@@ -859,9 +868,10 @@ class SimulatorGUI:
 
         prof_set.grid_rowconfigure(len(rows) + 1, minsize=12)
         self.active_prof_label = ttk.Label(prof_set, text="Active profile:", font=self.active_prof_font, width=16, anchor="w")
-        self.active_prof_value = ttk.Label(prof_set, text="—", font=self.active_prof_font, width=20, anchor="w")  # width widened
+        self.active_prof_value = ttk.Label(prof_set, text="—", font=self.active_prof_font, width=20, anchor="w")
         self.active_prog = ttk.Progressbar(
-            prof_set, orient="horizontal", mode="determinate", maximum=100, value=0,
+            prof_set, orient="horizontal", mode="determinate",
+            maximum=1000, value=0,
             style="Profile.Normal.Horizontal.TProgressbar",
         )
         base_row = len(rows) + 2
@@ -869,7 +879,7 @@ class SimulatorGUI:
         self.active_prof_value.grid(row=base_row, column=1, sticky="w", pady=(6, 0))
         self.active_prog.grid(row=base_row, column=2, columnspan=3, sticky="ew", pady=(6, 0))
 
-        # --- Status (fixed columns) ---
+        # --- Current status (fixed columns) ---
         stat = ttk.LabelFrame(root, text="Current status", padding=8)
         stat.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
         for i in range(6):
@@ -957,9 +967,9 @@ class SimulatorGUI:
         self._update_start_btn_state()
         self._rebuild_tx_tables()
 
-        # Timers to drain queues
+        # Timers to drain queues (profile at ~60fps)
         self.root.after(120, self._drain_rate_queue)
-        self.root.after(80, self._drain_profile_queue)
+        self.root.after(16, self._drain_profile_queue)
         self.root.after(120, self._drain_stats_queue)
         self.root.after(80, self._drain_tx_queue)
 
@@ -1093,6 +1103,12 @@ class SimulatorGUI:
         self._auto_resize_to_fit()  # action-triggered auto-resize
 
     def _clear_status_and_tx(self):
+        # reset colors & progress animation
+        self._set_status_area_color(self.col_text, include_fix=True)
+        self._prog_value = 0.0
+        self._prog_target = 0.0
+        self._prog_last_t = time.perf_counter()
+
         self.lbl_speed_big.config(text="Speed: —")
         self.lbl_time_utc.config(text="Time (UTC): —")
         self.lbl_time_loc.config(text="Time (Local): —")
@@ -1114,6 +1130,26 @@ class SimulatorGUI:
             vals[1] = ""  # sentence
             self.nmea_tree.item(iid, values=vals)
         self._force_refresh_treeviews()
+
+    # ----- status area coloring helpers -----
+    def _set_status_area_color(self, color: str, include_fix: bool = False):
+        labels = [
+            self.lbl_speed_big, self.lbl_time_utc, self.lbl_time_loc,
+            self.lbl_heading, self.lbl_sats, self.lbl_lat, self.lbl_lon
+        ]
+        for lbl in labels:
+            try:
+                lbl.configure(foreground=color)
+            except Exception:
+                pass
+        if include_fix:
+            try:
+                self.lbl_fix_status.configure(foreground=color)
+            except Exception:
+                pass
+
+    def _reset_status_area_basecolor(self):
+        self._set_status_area_color(self.col_text, include_fix=False)
 
     # ----- auto-resize window ON ACTION -----
     def _auto_resize_to_fit(self):
@@ -1262,14 +1298,19 @@ class SimulatorGUI:
                     self._current_is_lost = bool(info.get("is_lost", False))
                     self._current_profile_name = info.get("name", "—")
                     self.active_prof_value.config(text=self._current_profile_name)
-                    self.active_prog["value"] = int(float(info.get("progress", 0.0)) * 100.0)
+
+                    # target progress 0..1 for animator
+                    t = float(info.get("progress", 0.0))
+                    self._prog_target = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+
+                    # style applied by animator; keep in sync here too
                     self.active_prog.configure(
                         style=("Profile.Lost.Horizontal.TProgressbar" if self._current_is_lost
                                else "Profile.Normal.Horizontal.TProgressbar")
                     )
         except queue.Empty:
             pass
-        self.root.after(80, self._drain_profile_queue)
+        self.root.after(16, self._drain_profile_queue)  # ~60fps feed
 
     def _set_fix_text(self, text: str, color: str):
         self.lbl_fix_status.configure(text=text, foreground=color)
@@ -1290,17 +1331,20 @@ class SimulatorGUI:
                         self.lbl_lat.config(text=f"Lat: {und}")
                         self.lbl_lon.config(text=f"Lon: {und}")
                         self._set_fix_text("FIX: GPS DISABLED", self.col_gray)
+                        self._set_status_area_color(self.col_gray, include_fix=True)
                     elif prof == "NO_FIX":
                         und = self.UND
                         self.lbl_speed_big.config(text=f"Speed: {und}")
                         self.lbl_time_utc.config(text=f"Time (UTC): {und}")
                         self.lbl_time_loc.config(text=f"Time (Local): {und}")
                         self.lbl_heading.config(text=f"Heading: {und}")
-                        self.lbl_sats.config(text=f"Sats: {und}")
+                        self.lbl_sats.config(text=f"Sats: {int(s.get('sats', 0))}")
                         self.lbl_lat.config(text=f"Lat: {und}")
                         self.lbl_lon.config(text=f"Lon: {und}")
+                        self._reset_status_area_basecolor()
                         self._set_fix_text("FIX: NO FIX", self.col_red)
                     else:
+                        self._reset_status_area_basecolor()
                         spd = s.get("speed", 0.0)
                         fx = int(s.get("fix", 0))
                         self.lbl_speed_big.config(text=f"Speed: {spd:.1f} km/h")
@@ -1339,6 +1383,30 @@ class SimulatorGUI:
         except queue.Empty:
             pass
         self.root.after(80, self._drain_tx_queue)
+
+    # ----- 60fps animator for progressbar -----
+    def _animate_progress(self):
+        """60fps animator: ease progress value toward target using time-based smoothing."""
+        try:
+            now = time.perf_counter()
+            dt = max(0.0, min(0.1, now - self._prog_last_t))
+            self._prog_last_t = now
+
+            alpha = 1.0 - math.exp(-self._prog_alpha_per_s * dt)
+            self._prog_value += (self._prog_target - self._prog_value) * alpha
+
+            if abs(self._prog_target - self._prog_value) < 0.001:
+                self._prog_value = self._prog_target
+
+            self.active_prog["value"] = int(self._prog_value * 1000)
+            self.active_prog.configure(
+                style=("Profile.Lost.Horizontal.TProgressbar" if self._current_is_lost
+                       else "Profile.Normal.Horizontal.TProgressbar")
+            )
+        except Exception:
+            pass
+        finally:
+            self.root.after(16, self._animate_progress)
 
     # ----- start / stop / apply -----
     def start_sim(self):
