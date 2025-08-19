@@ -742,8 +742,8 @@ static void updateScreen()
     display.print("LOST");
   else if (pvt.fixType < 2)
     display.print("---");
-  else if ((float)pvt.sAcc > 0.2f * (float)pvt.gSpeed)
-    display.print("..."); // Speed not reliable
+  // else if ((float)pvt.sAcc > 0.2f * (float)pvt.gSpeed) // Enable this to filter out speed if accuracy is +- 20%
+  //   display.print("..."); // Speed not reliable
   else
   {
     speedCalc = mmps_to_kmh(pvt.gSpeed);
