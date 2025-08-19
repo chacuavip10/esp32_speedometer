@@ -807,6 +807,12 @@ void setup()
     Serial.println("!!! Cannot detect GPS baudrate (no valid UBX/NMEA on known rates).");
   if (CURRENT_BAUD_RATE == 38400)
   {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(0, 14);
+    display.print("Send CMD");
+    display.display();
     Serial.println("Looklike the GPS Module has factory setting!. Setting up the module now!).");
     // GPS UART2 at default baud
     GPS.begin(CURRENT_BAUD_RATE, SERIAL_8N1, PIN_RXD2, PIN_TXD2);
@@ -816,10 +822,24 @@ void setup()
     // Default 38400 rate //
     //-------------------------------------------//
     Serial.println(F("Send configuration (ACK via 10-byte read):"));
+
+    auto drawAckToOLED = [&](const char *name, bool ok)
+    {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setCursor(0, 14); // dòng 1
+      display.print(name);
+      display.setCursor(0, 36); // dòng 2
+      display.print(ok ? "OK" : "NOK");
+      display.display();
+    };
+
     auto sendWithAckLog = [&](const uint8_t *cmd, uint8_t cls, uint8_t id, const char *name, uint16_t timeout)
     {
       bool ok = sendUbxWithAck(cmd, cls, id, timeout);
       Serial.printf("%s: %s\n", name, ok ? "ACK OK" : "ACK FAIL/Timeout");
+      drawAckToOLED(name, ok); // NEW: hiển thị lên OLED
       delay(20);
       return ok;
     };
