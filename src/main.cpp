@@ -331,6 +331,9 @@ static const uint8_t GAL_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00
 
 static const uint8_t GAL_E1_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, 0x00, 0x31, 0x10, 0x00, 0xE2, 0x07};
 
+static const uint8_t BDS_B1_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0D, 0x00, 0x31, 0x10, 0x00, 0xE8, 0x25}; // BEIDOU B1I OFF
+static const uint8_t BDS_B1C_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0F, 0x00, 0x31, 0x10, 0x01, 0xEB, 0x30};    // BEIDOU B1C ON, same frequency as GPS L1 -> same antenna
+
 // BAUD RATE
 static const uint8_t CFG_UART1_BAUDRATE_115200[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0xC2, 0x01, 0x00, 0xF3, 0xA5};
 static const uint8_t CFG_UART1_BAUDRATE_38400[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0x96, 0x00, 0x00, 0xC6, 0x1F};
@@ -794,7 +797,7 @@ void setup()
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(4);
   display.setCursor(0, 14);
-  display.print("SETUP");
+  display.print("START");
   display.display();
 
   pinMode(PIN_BUTTON, INPUT_PULLDOWN);
@@ -811,7 +814,7 @@ void setup()
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(2);
     display.setCursor(0, 14);
-    display.print("Send CMD");
+    display.print("SETUP");
     display.display();
     Serial.println("Looklike the GPS Module has factory setting!. Setting up the module now!).");
     // GPS UART2 at default baud
@@ -878,6 +881,11 @@ void setup()
     delay(1000);
     sendWithAckLog(GAL_E1_ENA_OFF, 0x06, 0x8a, "GAL_E1_ENA_OFF", 1000);
     delay(1000);
+    // if use GPS only antenna, BEIDOU B1C same freq as GPS
+    // sendWithAckLog(BDS_B1_ENA_OFF, 0x06, 0x8a, "BDS_B1I_ENA_OFF", 1000);
+    // delay(1000);
+    // sendWithAckLog(BDS_B1C_ENA, 0x06, 0x8a, "BDS_B1C_ENA", 1000);
+    // delay(1000);
 
     // Change baud to 115200 (CFG-PRT): send command, then ALWAYS reinit UART
     // sendWithAckLog(CFG_UART1_BAUDRATE_38400, 0x06, 0x8a, "CFG_UART1_BAUDRATE_38400", 1000);
@@ -897,7 +905,7 @@ void setup()
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(4);
   display.setCursor(0, 14);
-  display.print("START");
+  display.print("READY");
   display.display();
   delay(500);
   lastMaxLoopResetMs = millis();

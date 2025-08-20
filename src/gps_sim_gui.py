@@ -4,25 +4,19 @@
 """
 UBX + NMEA (v4.11) GPS Simulator GUI (Tkinter)
 
-Key features:
-- Multi-thread: UI thread + worker simulator thread
-- Serial write if port opens; otherwise runs offline (still generates data & updates UI)
-- Port initially blank; Baud combobox enabled only after choosing a port
-- Start enabled only when Port & Baudrate are set and at least one message is selected
-- Apply-to-running resets sim and applies changes (including update rate); button lights only when settings changed
-- Profiles with linear speed ramp; NO_FIX and GPS_DISABLE special modes
-- Active profile shown inside Profile settings; 60fps smoothed progress bar (gray in NO_FIX/GPS_DISABLE)
-- Status area with fixed columns; Speed standout line; FIX text as:
-    * "3D FIX" (green) for fix=3, "2D FIX" (green) for fix=2, "NO FIX" (red) otherwise
-    * "GPS DISABLED" (gray) in GPS_DISABLE profile
-    * In NO_FIX or GPS_DISABLE, numeric metrics show as "______"
-    * In GPS_DISABLE the entire status area turns gray
-- Message settings:
-    * Update rate (Hz) (applies on Apply-to-running)
-    * Master checkboxes (Enable UBX / Enable NMEA) aligned with child checkboxes (3-column layout)
-    * Actual send rate per message (UBX + NMEA)
-- TX Monitor lists latest UBX (hex, full) and NMEA (text) per enabled message; right-click to copy
-- Auto-resize window height on actions (not on timer) to fit TX rows; min size stable to avoid jumpiness
+Highlights:
+- UI thread (Tkinter) + worker thread (simulator).
+- Start only when: Port chosen (initially blank), Baud chosen, ≥1 message enabled.
+- "Apply to running" resets the sim & applies current settings (including update rate); button enabled only when settings changed.
+- Message settings: master checkboxes (UBX/NMEA) + 3-column children, actual rate per message (UBX & NMEA).
+- Profiles: STATIONARY, WALKING, CITY_DRIVING, HIGHWAY_DRIVING, HIGH_SPEED, NO_FIX, GPS_DISABLE.
+- Profile durations are integer seconds via Spinbox; 0s => disabled, >0 => enabled (checkbox mirrors duration).
+- Progress bar is data-driven (no 60fps animator). Worker emits a final 100% tick before switching profiles (Approach A).
+- Status area: big bold Speed, FIX colored (3D FIX/2D FIX green; NO FIX red; GPS DISABLE gray).
+- NO_FIX → numeric fields show "______"; GPS_DISABLE → entire status area gray.
+- TX Monitor: UBX hex (full, with byte length), NMEA text; rows equal to enabled messages; right-click to copy.
+- Window min size stable; auto-resizes once when TX rows count changes (no jitter).
+- All comments and labels in English.
 """
 
 import threading
@@ -41,15 +35,15 @@ try:
     import serial
     import serial.tools.list_ports
 except Exception:
-    serial = None  # UI can open; starting requires pyserial for real serial I/O
+    serial = None  # UI can run even if pyserial isn't installed
 
 
 # =========================
-# Math / UBX helpers
+# UBX helpers
 # =========================
 
 def ubx_checksum(body: bytes):
-    ck_a, ck_b = 0, 0
+    ck_a = ck_b = 0
     for b in body:
         ck_a = (ck_a + b) & 0xFF
         ck_b = (ck_b + ck_a) & 0xFF
@@ -68,20 +62,17 @@ def gps_week_and_tow_ms(now_utc: datetime):
     delta = now_utc - gps_epoch
     total_ms = int(delta.total_seconds() * 1000)
     week_ms = 7 * 24 * 3600 * 1000
-    week = total_ms // week_ms
-    itow = total_ms % week_ms
-    return int(week), int(itow)
+    return total_ms // week_ms, total_ms % week_ms
 
 
 def geodetic_to_ecef(lat_deg: float, lon_deg: float, h_m: float):
+    # WGS-84
     a = 6378137.0
     e2 = 6.69437999014e-3
     lat = math.radians(lat_deg)
     lon = math.radians(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
+    sin_lat, cos_lat = math.sin(lat), math.cos(lat)
+    sin_lon, cos_lon = math.sin(lon), math.cos(lon)
     N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
     x = (N + h_m) * cos_lat * cos_lon
     y = (N + h_m) * cos_lat * sin_lon
@@ -90,21 +81,14 @@ def geodetic_to_ecef(lat_deg: float, lon_deg: float, h_m: float):
 
 
 def ned_to_ecef(lat_deg: float, lon_deg: float, vn: float, ve: float, vd: float):
+    # NED -> ECEF rotation applied to velocity
     lat = math.radians(lat_deg)
     lon = math.radians(lon_deg)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    sin_lon = math.sin(lon)
-    cos_lon = math.cos(lon)
-    r11 = -sin_lat * cos_lon
-    r12 = -sin_lat * sin_lon
-    r13 = cos_lat
-    r21 = -sin_lon
-    r22 =  cos_lon
-    r23 =  0.0
-    r31 = -cos_lat * cos_lon
-    r32 = -cos_lat * sin_lon
-    r33 = -sin_lat
+    sin_lat, cos_lat = math.sin(lat), math.cos(lat)
+    sin_lon, cos_lon = math.sin(lon), math.cos(lon)
+    r11 = -sin_lat * cos_lon; r12 = -sin_lat * sin_lon; r13 =  cos_lat
+    r21 = -sin_lon;          r22 =  cos_lon;           r23 =  0.0
+    r31 = -cos_lat * cos_lon; r32 = -cos_lat * sin_lon; r33 = -sin_lat
     vx = r11 * vn + r12 * ve + r13 * vd
     vy = r21 * vn + r22 * ve + r23 * vd
     vz = r31 * vn + r32 * ve + r33 * vd
@@ -143,21 +127,22 @@ def knots_from_kmh(kmh: float) -> float:
 
 
 # =========================
-# Simulator worker
+# Simulator worker (Approach A implemented)
 # =========================
 
 class UbxNmeaSimulator:
     """
+    Worker thread that generates UBX & NMEA messages.
+    Communicates with UI via callbacks and a command queue.
+
     Control queue (from UI):
       - {"cmd": "reset", "cfg": <new_config_dict>}
 
     Callbacks (to UI):
-      - rate_cb(dict): actual rates per key
-      - profile_cb(dict): {"name": str, "progress": float, "is_lost": bool}
+      - rate_cb(dict): actual rates per message key
+      - profile_cb(dict): {"name", "progress", "is_lost", "seq"}  # seq increments on profile change
       - stats_cb(dict): {"utc","local","speed","heading","sats","fix","lat","lon"}
-      - tx_cb(dict_nmea, dict_ubx): latest payloads keyed by message name
-        * UBX keys: "pvt","velned","sol" (values: hex string)
-        * NMEA keys: "gga","gll","gsa","gsv","rmc","vtg" (values: sentence string)
+      - tx_cb(nmea_map, ubx_map): latest payloads keyed by message name
     """
     def __init__(
         self,
@@ -177,13 +162,14 @@ class UbxNmeaSimulator:
         self.tx_cb = tx_cb or (lambda n, u: None)
         self.stop_event = stop_event or threading.Event()
 
-        # Open serial if available; run offline if not
+        # Serial open (offline if pyserial missing or open fails)
         self.ser = None
         if serial is not None:
             self._open_serial(self.cfg["port"], self.cfg["baudrate"])
 
         self._apply_config(self.cfg, reset_all=True)
 
+    # ---- serial ----
     def _open_serial(self, port: str, baud: int):
         try:
             self.ser = serial.Serial(port, baud, timeout=0, write_timeout=0)
@@ -196,54 +182,52 @@ class UbxNmeaSimulator:
             except Exception:
                 pass
         except Exception:
-            # Offline mode (no serial). Keep running without raising.
-            self.ser = None
+            self.ser = None  # run offline
 
+    # ---- config & profile state ----
     def _apply_config(self, cfg: dict, reset_all: bool):
-        self.cfg = cfg
+        self.cfg = dict(cfg)  # shallow copy
         self.update_rate_hz = max(0.01, float(cfg["update_rate_hz"]))
         self.send_interval = 1.0 / self.update_rate_hz
 
         self.ubx_en = dict(cfg["ubx_enable"])
         self.nmea_en = dict(cfg["nmea_enable"])
 
-        self.PROFILES = dict(cfg["profiles"])
-        self.order = [
-            "STATIONARY",
-            "WALKING",
-            "CITY_DRIVING",
-            "HIGHWAY_DRIVING",
-            "HIGH_SPEED",
-            "NO_FIX",
-            "GPS_DISABLE",
-        ]
-        self.cycle = [p for p in self.order if self.PROFILES.get(p, {}).get("enabled", False)]
+        # Use durations from user settings; enabled means duration > 0
+        self.PROFILES = {k: dict(v) for k, v in cfg["profiles"].items()}
+        order = ["STATIONARY", "WALKING", "CITY_DRIVING", "HIGHWAY_DRIVING", "HIGH_SPEED", "NO_FIX", "GPS_DISABLE"]
+        # Effective cycle only includes profiles with duration > 0
+        self.cycle = [p for p in order if float(self.PROFILES.get(p, {}).get("duration", 0)) > 0.0]
         if not self.cycle:
-            self.PROFILES["STATIONARY"] = {"enabled": True, "min": 0, "max": 0, "duration": 5.0}
+            # Fallback: STATIONARY 5s if user disabled all via 0s
+            self.PROFILES["STATIONARY"] = {"min": 0, "max": 0, "duration": 5}
             self.cycle = ["STATIONARY"]
+
         self.current_profile = self.cycle[0]
         self.profile_start = time.perf_counter()
+        # Approach A tracking:
+        self.profile_seq = 0          # increments each time we actually switch to next profile
+        self._sent_final_prog = False # set True after we emit 100% tick; next loop will switch
 
         if reset_all:
+            # Initial state (London)
             self.lat, self.lon, self.h_m = 51.5074, -0.1278, 15.0
             self.speed_kmh, self.heading_deg, self.itow_ms = 0.0, 0.0, 0
             self.fix_type, self.sats = 3, 12
             self.hacc_mm, self.sacc_mms = 2000, 300
 
-        self._sent_counts = {
-            "pvt": 0, "velned": 0, "sol": 0,
-            "gga": 0, "gll": 0, "gsa": 0, "gsv": 0, "rmc": 0, "vtg": 0,
-        }
-        self._actual_rates = {k: 0.0 for k in self._sent_counts.keys()}
+        # Actual-rate tracking per message
+        keys = ["pvt", "velned", "sol", "gga", "gll", "gsa", "gsv", "rmc", "vtg"]
+        self._sent_counts = {k: 0 for k in keys}
+        self._actual_rates = {k: 0.0 for k in keys}
         self._last_rate_time = time.perf_counter()
         self.rate_cb(dict(self._actual_rates))
 
-    # ----- UBX builders (system time) -----
+    # ---- UBX builders (time from system clock) ----
     def build_nav_pvt(self) -> bytes:
         now = datetime.now(timezone.utc)
         payload = struct.pack('<L', int(self.itow_ms))
-        payload += struct.pack('<HBBBBBB', now.year, now.month, now.day,
-                               now.hour, now.minute, now.second, 0x07)
+        payload += struct.pack('<HBBBBBB', now.year, now.month, now.day, now.hour, now.minute, now.second, 0x07)
         payload += struct.pack('<L', 50000)  # tAcc ns
         payload += struct.pack('<l', 0)      # nano
         flags = 0x01 if self.fix_type >= 3 else 0x00
@@ -264,12 +248,12 @@ class UbxNmeaSimulator:
         payload += struct.pack('<lll', vel_n, vel_e, vel_d)
         payload += struct.pack('<l', int(abs(speed_mms)))               # gSpeed
         payload += struct.pack('<l', int(self.heading_deg * 1e5))       # headMot
-        payload += struct.pack('<L', self.sacc_mms)                      # sAcc
-        payload += struct.pack('<L', 1_000_000)                          # headAcc
-        payload += struct.pack('<H', 120)                                # pDOP
+        payload += struct.pack('<L', self.sacc_mms)                     # sAcc
+        payload += struct.pack('<L', 1_000_000)                         # headAcc
+        payload += struct.pack('<H', 120)                               # pDOP
         payload += b'\x00' * 6
-        payload += struct.pack('<l', int(self.heading_deg * 1e5))        # headVeh
-        payload += struct.pack('<hH', 500, 1000)                         # magDec, magAcc
+        payload += struct.pack('<l', int(self.heading_deg * 1e5))       # headVeh
+        payload += struct.pack('<hH', 500, 1000)                        # magDec, magAcc
         return to_ubx(0x01, 0x07, payload)
 
     def build_nav_velned(self) -> bytes:
@@ -294,13 +278,13 @@ class UbxNmeaSimulator:
         now = datetime.now(timezone.utc)
         week, itow_ms = gps_week_and_tow_ms(now)
         x_m, y_m, z_m = geodetic_to_ecef(self.lat, self.lon, self.h_m)
-        x_cm = int(x_m * 100.0); y_cm = int(y_m * 100.0); z_cm = int(z_m * 100.0)
+        x_cm, y_cm, z_cm = int(x_m * 100.0), int(y_m * 100.0), int(z_m * 100.0)
         speed_mms = self.speed_kmh * 1000.0 / 3.6
         vn = math.cos(math.radians(self.heading_deg)) * (speed_mms / 1000.0)
         ve = math.sin(math.radians(self.heading_deg)) * (speed_mms / 1000.0)
         vd = 0.0
         vx_mps, vy_mps, vz_mps = ned_to_ecef(self.lat, self.lon, vn, ve, vd)
-        vx_cms = int(vx_mps * 100.0); vy_cms = int(vy_mps * 100.0); vz_cms = int(vz_mps * 100.0)
+        vx_cms, vy_cms, vz_cms = int(vx_mps * 100.0), int(vy_mps * 100.0), int(vz_mps * 100.0)
         pacc_cm = max(1, int(self.hacc_mm / 10.0))
         sacc_cms = max(1, int(self.sacc_mms / 10.0))
         gpsFix = 3 if self.fix_type >= 3 else (2 if self.fix_type == 2 else 0)
@@ -320,7 +304,7 @@ class UbxNmeaSimulator:
         payload += struct.pack('<L', 0)
         return to_ubx(0x01, 0x06, payload)
 
-    # ----- NMEA builders -----
+    # ---- NMEA builders (time from system clock) ----
     def _utc_hhmmss_frac(self) -> str:
         now = datetime.now(timezone.utc)
         return f"{now:%H%M%S}.{int(now.microsecond/1000):03d}"
@@ -331,152 +315,161 @@ class UbxNmeaSimulator:
 
     def build_nmea_gga(self) -> str:
         t = self._utc_hhmmss_frac()
-        lat, ns = deg_to_nmea_lat(self.lat)
-        lon, ew = deg_to_nmea_lon(self.lon)
+        lat, ns = deg_to_nmea_lat(self.lat); lon, ew = deg_to_nmea_lon(self.lon)
         fixq = '1' if self.fix_type >= 2 else '0'
         nums = f"{max(0, min(12, self.sats)):02d}"
-        hdop = "1.2"
-        alt = f"{self.h_m:.1f}"
-        geoid = "0.0"
+        hdop = "1.2"; alt = f"{self.h_m:.1f}"; geoid = "0.0"
         parts = ["GNGGA", t, lat, ns, lon, ew, fixq, nums, hdop, alt, "M", geoid, "M", "", ""]
         core = ",".join(parts)
         return f"${core}*{nmea_checksum(core)}\r\n"
 
     def build_nmea_gll(self) -> str:
         t = self._utc_hhmmss_frac()
-        lat, ns = deg_to_nmea_lat(self.lat)
-        lon, ew = deg_to_nmea_lon(self.lon)
+        lat, ns = deg_to_nmea_lat(self.lat); lon, ew = deg_to_nmea_lon(self.lon)
         status = 'A' if self.fix_type >= 2 else 'V'
         mode = 'A' if self.fix_type >= 3 else ('D' if self.fix_type == 2 else 'N')
-        parts = ["GNGLL", lat, ns, lon, ew, t, status, mode]
-        core = ",".join(parts)
+        core = ",".join(["GNGLL", lat, ns, lon, ew, t, status, mode])
         return f"${core}*{nmea_checksum(core)}\r\n"
 
     def build_nmea_gsa(self) -> str:
-        mode1 = 'A'
-        mode2 = '3' if self.fix_type >= 3 else ('2' if self.fix_type == 2 else '1')
+        mode1 = 'A'; mode2 = '3' if self.fix_type >= 3 else ('2' if self.fix_type == 2 else '1')
         prns = [f"{i:02d}" for i in range(1, 13)]
-        pdop, hdop, vdop = "1.8", "1.0", "1.5"
-        parts = ["GNGSA", mode1, mode2] + prns + [pdop, hdop, vdop]
-        core = ",".join(parts)
+        core = ",".join(["GNGSA", mode1, mode2] + prns + ["1.8", "1.0", "1.5"])
         return f"${core}*{nmea_checksum(core)}\r\n"
 
     def build_nmea_gsv(self) -> str:
-        total = 1
-        msg_no = 1
         in_view = max(0, self.sats)
         sats = []
         for i in range(1, min(4, in_view) + 1):
-            sats += [
-                f"{i:02d}",
-                f"{random.randint(10, 80):02d}",
-                f"{random.randint(0, 359):03d}",
-                f"{random.randint(20, 45):02d}",
-            ]
+            sats += [f"{i:02d}", f"{random.randint(10, 80):02d}",
+                     f"{random.randint(0, 359):03d}", f"{random.randint(20, 45):02d}"]
         while len(sats) < 16:
             sats.append("")
-        parts = ["GNGSV", str(total), str(msg_no), f"{in_view:02d}"] + sats[:16]
-        core = ",".join(parts)
+        core = ",".join(["GNGSV", "1", "1", f"{in_view:02d}"] + sats[:16])
         return f"${core}*{nmea_checksum(core)}\r\n"
 
     def build_nmea_rmc(self) -> str:
-        t = self._utc_hhmmss_frac()
+        t = self._utc_hhmmss_frac(); date = self._utc_date_ddmmyy()
         status = 'A' if self.fix_type >= 2 else 'V'
-        lat, ns = deg_to_nmea_lat(self.lat)
-        lon, ew = deg_to_nmea_lon(self.lon)
-        spd_kn = f"{knots_from_kmh(self.speed_kmh):.1f}"
-        cog = f"{self.heading_deg:.1f}"
-        date = self._utc_date_ddmmyy()
-        magv = ""
+        lat, ns = deg_to_nmea_lat(self.lat); lon, ew = deg_to_nmea_lon(self.lon)
+        spd_kn = f"{knots_from_kmh(self.speed_kmh):.1f}"; cog = f"{self.heading_deg:.1f}"
         mode = 'A' if self.fix_type >= 3 else ('D' if self.fix_type == 2 else 'N')
-        parts = ["GNRMC", t, status, lat, ns, lon, ew, spd_kn, cog, date, magv, "", mode]
-        core = ",".join(parts)
+        core = ",".join(["GNRMC", t, status, lat, ns, lon, ew, spd_kn, cog, date, "", "", mode])
         return f"${core}*{nmea_checksum(core)}\r\n"
 
     def build_nmea_vtg(self) -> str:
-        cog_t = f"{self.heading_deg:.1f}"
-        cog_m = ""
-        spd_kn = f"{knots_from_kmh(self.speed_kmh):.1f}"
-        spd_kmh = f"{self.speed_kmh:.1f}"
+        cog_t = f"{self.heading_deg:.1f}"; spd_kn = f"{knots_from_kmh(self.speed_kmh):.1f}"; spd_kmh = f"{self.speed_kmh:.1f}"
         mode = 'A' if self.fix_type >= 3 else ('D' if self.fix_type == 2 else 'N')
-        parts = ["GNVTG", cog_t, "T", cog_m, "M", spd_kn, "N", spd_kmh, "K", mode]
-        core = ",".join(parts)
+        core = ",".join(["GNVTG", cog_t, "T", "", "M", spd_kn, "N", spd_kmh, "K", mode])
         return f"${core}*{nmea_checksum(core)}\r\n"
 
-    # ----- profile helpers -----
+    # ---- profile helpers (Approach A) ----
     def _profiles_cycle(self) -> List[str]:
-        return [p for p in self.order if self.PROFILES.get(p, {}).get("enabled", False)]
+        # Only those with duration > 0
+        return [p for p in self.cycle if float(self.PROFILES.get(p, {}).get("duration", 0)) > 0.0]
 
     def _advance_profile_if_needed(self, now: float):
-        info = self.PROFILES.get(self.current_profile, {"duration": 5.0})
-        dur = max(0.1, float(info.get("duration", 5.0)))
-        if now - self.profile_start > dur:
-            cyc = self._profiles_cycle()
-            if not cyc:
-                return
-            if self.current_profile not in cyc:
-                self.current_profile = cyc[0]
-            else:
-                idx = cyc.index(self.current_profile)
-                self.current_profile = cyc[(idx + 1) % len(cyc)]
-            self.profile_start = now
+        """Approach A: emit one final 100% progress tick, then switch on next loop."""
+        info = self.PROFILES.get(self.current_profile, {"duration": 5})
+        dur = max(0.0, float(info.get("duration", 5)))  # 0 handled by filtering cycle
 
+        if dur == 0.0:
+            # if ever happens mid-run (shouldn't), skip to next
+            cyc = self._profiles_cycle()
+            if cyc:
+                idx = cyc.index(self.current_profile) if self.current_profile in cyc else -1
+                self.current_profile = cyc[(idx + 1) % len(cyc)] if idx >= 0 else cyc[0]
+                self.profile_start = now
+                self.profile_seq += 1
+                self._sent_final_prog = False
+            return
+
+        if now - self.profile_start >= dur:
+            if not self._sent_final_prog:
+                # Send final tick at 100% for current profile
+                is_lost = self.current_profile in ("NO_FIX", "GPS_DISABLE")
+                self.profile_cb({
+                    "name": self.current_profile,
+                    "progress": 1.0,
+                    "is_lost": is_lost,
+                    "seq": self.profile_seq,
+                })
+                self._sent_final_prog = True
+                return  # Defer switch to next loop to ensure UI can render 100%
+
+            # Now actually switch profile (respect user-enabled via duration>0)
+            cyc = self._profiles_cycle()
+            if cyc:
+                idx = cyc.index(self.current_profile) if self.current_profile in cyc else -1
+                self.current_profile = cyc[(idx + 1) % len(cyc)] if idx >= 0 else cyc[0]
+            self.profile_start = now
+            self.profile_seq += 1
+            self._sent_final_prog = False
+
+    def _emit_profile(self, now: float):
+        """Continuous profile progress updates (progress=1.0 if final tick already sent)."""
+        info = self.PROFILES.get(self.current_profile, {"duration": 5})
+        dur = max(0.0, float(info.get("duration", 5)))
+        progress = 0.0
+        if dur > 0.0:
+            progress = 1.0 if self._sent_final_prog else min(1.0, max(0.0, (now - self.profile_start) / dur))
+        is_lost = self.current_profile in ("NO_FIX", "GPS_DISABLE")
+        self.profile_cb({
+            "name": self.current_profile,
+            "progress": progress,
+            "is_lost": is_lost,
+            "seq": self.profile_seq,
+        })
+
+    # ---- status emit ----
+    def _emit_stats(self):
+        now_utc = datetime.now(timezone.utc)
+        now_loc = datetime.now()
+        self.stats_cb({
+            "utc": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "local": now_loc.strftime("%Y-%m-%d %H:%M:%S"),
+            "speed": float(self.speed_kmh),
+            "heading": float(self.heading_deg),
+            "sats": int(self.sats),
+            "fix": int(self.fix_type),
+            "lat": float(self.lat),
+            "lon": float(self.lon),
+        })
+
+    # ---- movement & quality ----
     def _target_speed(self, now: float) -> float:
-        info = self.PROFILES.get(self.current_profile, {"min": 0, "max": 0, "duration": 5.0})
-        mn, mx = float(info["min"]), float(info["max"])
-        if mn < 0:  # NO_FIX / GPS_DISABLE markers
+        p = self.PROFILES.get(self.current_profile, {"min": 0, "max": 0, "duration": 5})
+        mn, mx = float(p.get("min", 0)), float(p.get("max", 0))
+        if mn < 0:     # NO_FIX/GPS_DISABLE markers (kept for backward compat, not used for enable)
             return mn
         if mn == 0 and mx == 0:
             return 0.0
         el = now - self.profile_start
-        dur = max(0.1, float(info["duration"]))
+        dur = max(0.1, float(p.get("duration", 5)))
         progress = min(1.0, el / dur)
         return max(0.0, mn + (mx - mn) * progress + random.uniform(-2.0, 2.0))
 
-    def _emit_profile(self, now: float):
-        info = self.PROFILES.get(self.current_profile, {"duration": 5.0})
-        dur = max(0.1, float(info.get("duration", 5.0)))
-        progress = min(1.0, max(0.0, (now - self.profile_start) / dur))
-        is_lost = self.current_profile in ("NO_FIX", "GPS_DISABLE")  # gray progressbar
-        self.profile_cb({"name": self.current_profile, "progress": progress, "is_lost": is_lost})
-
-    def _emit_stats(self):
-        now_utc = datetime.now(timezone.utc)
-        now_loc = datetime.now()
-        self.stats_cb(
-            {
-                "utc": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "local": now_loc.strftime("%Y-%m-%d %H:%M:%S"),
-                "speed": float(self.speed_kmh),
-                "heading": float(self.heading_deg),
-                "sats": int(self.sats),
-                "fix": int(self.fix_type),
-                "lat": float(self.lat),
-                "lon": float(self.lon),
-            }
-        )
-
-    # ----- main loop -----
+    # ---- main loop ----
     def run(self):
         next_send = time.perf_counter() + self.send_interval
         next_rate = time.perf_counter() + 1.0
+
         try:
             while not self.stop_event.is_set():
-                # control
+                # Handle control messages
                 try:
                     while True:
                         cmd = self.ctrl_q.get_nowait()
                         if isinstance(cmd, dict) and cmd.get("cmd") == "reset":
                             new_cfg = cmd.get("cfg", {})
                             if serial is not None and (
-                                new_cfg.get("port") != self.cfg.get("port")
-                                or new_cfg.get("baudrate") != self.cfg.get("baudrate")
+                                new_cfg.get("port") != self.cfg.get("port") or
+                                new_cfg.get("baudrate") != self.cfg.get("baudrate")
                             ):
                                 self._open_serial(new_cfg["port"], new_cfg["baudrate"])
                             self._apply_config(new_cfg, reset_all=True)
                             now = time.perf_counter()
-                            next_send = now + self.send_interval
-                            next_rate = now + 1.0
+                            next_send, next_rate = now + self.send_interval, now + 1.0
                 except queue.Empty:
                     pass
 
@@ -484,7 +477,7 @@ class UbxNmeaSimulator:
                 self._advance_profile_if_needed(now)
                 self._emit_profile(now)
 
-                # quality & modes
+                # Quality depending on profile
                 active_send = True
                 if self.current_profile == "GPS_DISABLE":
                     active_send = False
@@ -497,19 +490,17 @@ class UbxNmeaSimulator:
                     self.sacc_mms = random.randint(1500, 5000)
                 else:
                     if random.random() < 0.05:
-                        self.fix_type = 2
-                        self.sats = random.randint(4, 8)
+                        self.fix_type = 2; self.sats = random.randint(4, 8)
                         self.hacc_mm = random.randint(5000, 15000)
                         self.sacc_mms = random.randint(500, 2000)
                     else:
-                        self.fix_type = 3
-                        self.sats = random.randint(8, 16)
+                        self.fix_type = 3; self.sats = random.randint(8, 16)
                         self.hacc_mm = random.randint(1000, 5000)
                         self.sacc_mms = random.randint(200, 800)
                     if random.random() < 0.002:
-                        self.fix_type = 0
-                        self.sats = random.randint(0, 4)
+                        self.fix_type = 0; self.sats = random.randint(0, 4)
 
+                # Motion
                 tgt = self._target_speed(now)
                 if tgt >= 0:
                     delta = tgt - self.speed_kmh
@@ -521,105 +512,63 @@ class UbxNmeaSimulator:
                         self.lat += random.uniform(-0.0001, 0.0001) * factor
                         self.lon += random.uniform(-0.0001, 0.0001) * factor
 
+                # Time-of-week advances with send interval
                 self.itow_ms = (self.itow_ms + int(self.send_interval * 1000)) % 604_800_000
                 self._emit_stats()
 
-                # Send tick
+                # Send messages on schedule
                 nmea_map: Dict[str, str] = {}
                 ubx_map: Dict[str, str] = {}
 
                 if active_send and now >= next_send:
                     # UBX
-                    if self.ubx_en.get("pvt", False):
+                    if self.ubx_en.get("pvt"):
                         pkt = self.build_nav_pvt()
                         try:
-                            if self.ser:
-                                self.ser.write(pkt)
-                        except Exception:
-                            pass
+                            if self.ser: self.ser.write(pkt)
+                        except Exception: pass
                         self._sent_counts["pvt"] += 1
                         ubx_map["pvt"] = pkt.hex().upper()
-                    if self.ubx_en.get("velned", False):
+                    if self.ubx_en.get("velned"):
                         pkt = self.build_nav_velned()
                         try:
-                            if self.ser:
-                                self.ser.write(pkt)
-                        except Exception:
-                            pass
+                            if self.ser: self.ser.write(pkt)
+                        except Exception: pass
                         self._sent_counts["velned"] += 1
                         ubx_map["velned"] = pkt.hex().upper()
-                    if self.ubx_en.get("sol", False):
+                    if self.ubx_en.get("sol"):
                         pkt = self.build_nav_sol()
                         try:
-                            if self.ser:
-                                self.ser.write(pkt)
-                        except Exception:
-                            pass
+                            if self.ser: self.ser.write(pkt)
+                        except Exception: pass
                         self._sent_counts["sol"] += 1
                         ubx_map["sol"] = pkt.hex().upper()
 
                     # NMEA
-                    if self.nmea_en.get("gga", False):
-                        s = self.build_nmea_gga()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["gga"] += 1
-                        nmea_map["gga"] = s.strip()
-                    if self.nmea_en.get("gll", False):
-                        s = self.build_nmea_gll()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["gll"] += 1
-                        nmea_map["gll"] = s.strip()
-                    if self.nmea_en.get("gsa", False):
-                        s = self.build_nmea_gsa()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["gsa"] += 1
-                        nmea_map["gsa"] = s.strip()
-                    if self.nmea_en.get("gsv", False):
-                        s = self.build_nmea_gsv()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["gsv"] += 1
-                        nmea_map["gsv"] = s.strip()
-                    if self.nmea_en.get("rmc", False):
-                        s = self.build_nmea_rmc()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["rmc"] += 1
-                        nmea_map["rmc"] = s.strip()
-                    if self.nmea_en.get("vtg", False):
-                        s = self.build_nmea_vtg()
-                        try:
-                            if self.ser:
-                                self.ser.write(s.encode("ascii"))
-                        except Exception:
-                            pass
-                        self._sent_counts["vtg"] += 1
-                        nmea_map["vtg"] = s.strip()
+                    for key, builder in (
+                        ("gga", self.build_nmea_gga),
+                        ("gll", self.build_nmea_gll),
+                        ("gsa", self.build_nmea_gsa),
+                        ("gsv", self.build_nmea_gsv),
+                        ("rmc", self.build_nmea_rmc),
+                        ("vtg", self.build_nmea_vtg),
+                    ):
+                        if self.nmea_en.get(key):
+                            s = builder()
+                            try:
+                                if self.ser: self.ser.write(s.encode("ascii"))
+                            except Exception: pass
+                            self._sent_counts[key] += 1
+                            nmea_map[key] = s.strip()
 
                     if nmea_map or ubx_map:
                         self.tx_cb(nmea_map, ubx_map)
 
+                    # Catch up in case of lag
                     skips = max(1, int((now - next_send) // self.send_interval) + 1)
                     next_send += skips * self.send_interval
 
+                # Actual-rate update every 1s
                 if now >= next_rate:
                     elapsed = max(1e-6, now - self._last_rate_time)
                     for k in self._sent_counts:
@@ -630,14 +579,12 @@ class UbxNmeaSimulator:
                     steps = max(1, int((now - next_rate) // 1.0) + 1)
                     next_rate += steps * 1.0
 
-                self._emit_profile(time.perf_counter())
                 time.sleep(0.01)
+
         finally:
             try:
-                if self.ser:
-                    self.ser.close()
-            except Exception:
-                pass
+                if self.ser: self.ser.close()
+            except Exception: pass
 
 
 # =========================
@@ -645,7 +592,12 @@ class UbxNmeaSimulator:
 # =========================
 
 class SimulatorGUI:
-    UND = "______"  # placeholder for lost/disabled
+    UND = "______"  # placeholder for NO_FIX / GPS_DISABLE
+    DEFAULT_DUR = {
+        "STATIONARY": 5, "WALKING": 5, "CITY_DRIVING": 5,
+        "HIGHWAY_DRIVING": 5, "HIGH_SPEED": 5,
+        "NO_FIX": 5, "GPS_DISABLE": 10,
+    }
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -663,36 +615,30 @@ class SimulatorGUI:
         self.col_green = "#2e7d32"
         self.col_red   = "#c62828"
         self.col_gray  = "#9e9e9e"
-        self.col_text  = "#000000"   # default text color for status area
+        self.col_text  = "#000000"
 
-        # Queues
+        # Queues for UI updates
         self.rate_queue = queue.Queue()
         self.profile_queue = queue.Queue()
         self.stats_queue = queue.Queue()
         self.tx_queue = queue.Queue()
         self.ctrl_queue = queue.Queue()
 
-        # Thread control
+        # Worker control
         self.sim_thread = None
         self.stop_event = threading.Event()
         self.sim_running = False
 
-        # Dirty tracking
+        # Dirty tracking (for "Apply to running")
         self._last_applied_config = None
         self._dirty = False
 
-        # Profile tracking
+        # Profile direct data update (no animator)
         self._current_profile_name = "—"
         self._current_is_lost = False
+        self._last_profile_seq = None  # detects profile switch to reset bar
 
-        # Progressbar smoothing (60fps)
-        self._prog_value = 0.0      # current 0..1
-        self._prog_target = 0.0     # target 0..1
-        self._prog_last_t = time.perf_counter()
-        self._prog_alpha_per_s = 6.0  # higher = snappier
-        self.root.after(16, self._animate_progress)  # start 60fps animator
-
-        # --- Top bar: Port + Baud ---
+        # ==== Top: Port & Baud ====
         top = ttk.Frame(root, padding=8)
         top.grid(row=0, column=0, sticky="ew")
         for c, w in enumerate([60, 260, 90, 80, 240]):
@@ -711,16 +657,13 @@ class SimulatorGUI:
         ttk.Label(top, text="Baudrate:").grid(row=0, column=3, sticky="e")
         self.baud_var = tk.StringVar(value="115200")
         self.baud_cb = ttk.Combobox(
-            top,
-            textvariable=self.baud_var,
-            width=12,
-            state="disabled",  # enabled after port selected
+            top, textvariable=self.baud_var, width=12, state="disabled",
             values=["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"],
         )
         self.baud_cb.grid(row=0, column=4, sticky="w", padx=(6, 0))
         self.baud_cb.bind("<<ComboboxSelected>>", self._on_any_setting_changed)
 
-        # --- Message settings (masters aligned with children) ---
+        # ==== Message settings (Update rate + UBX/NMEA masters & children in 3 columns) ====
         msg = ttk.LabelFrame(root, text="Message settings", padding=8)
         msg.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
         for c in range(6):
@@ -732,22 +675,17 @@ class SimulatorGUI:
         self.hz_entry.grid(row=0, column=1, sticky="w", padx=(6, 18))
         self.hz_entry.bind("<KeyRelease>", self._on_any_setting_changed)
 
-        # === UBX group: master + children in the same grid ===
+        # -- UBX master + 3-column children --
         self.ubx_master_var = tk.BooleanVar(value=True)
-        self.ubx_group = ttk.Frame(msg)
-        self.ubx_group.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(6, 4))
+        self.ubx_group = ttk.Frame(msg); self.ubx_group.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(6, 4))
         for c in range(6):
             self.ubx_group.grid_columnconfigure(c, minsize=180)
-
         self.ubx_master_chk = ttk.Checkbutton(
             self.ubx_group, text="Enable UBX messages",
             variable=self.ubx_master_var, command=self._on_master_toggled
         )
         self.ubx_master_chk.grid(row=0, column=0, sticky="w")
-
-        ttk.Separator(self.ubx_group, orient="horizontal").grid(
-            row=1, column=0, columnspan=6, sticky="ew", pady=(4, 6)
-        )
+        ttk.Separator(self.ubx_group, orient="horizontal").grid(row=1, column=0, columnspan=6, sticky="ew", pady=(4, 6))
 
         self.pvt_var = tk.BooleanVar(value=True)
         self.vel_var = tk.BooleanVar(value=False)
@@ -761,52 +699,42 @@ class SimulatorGUI:
             chk = ttk.Checkbutton(parent, text=text, variable=var, command=on_child)
             lbl = ttk.Label(parent, text="", font=self.mono_font, width=16)
             c = col_pair * 2
-            chk.grid(row=row, column=c, sticky="w")
-            lbl.grid(row=row, column=c + 1, sticky="w")
+            chk.grid(row=row, column=c, sticky="w"); lbl.grid(row=row, column=c + 1, sticky="w")
             return lbl
 
         self.pvt_rate = add_ubx_cell(self.ubx_group, 2, 0, "UBX-NAV-PVT", self.pvt_var)
         self.vel_rate = add_ubx_cell(self.ubx_group, 2, 1, "UBX-NAV-VELNED", self.vel_var)
         self.sol_rate = add_ubx_cell(self.ubx_group, 2, 2, "UBX-NAV-SOL", self.sol_var)
 
-        # Separator between UBX and NMEA groups
-        ttk.Separator(msg, orient="horizontal").grid(
-            row=2, column=0, columnspan=6, sticky="ew", pady=(6, 6)
-        )
+        # Separator between UBX & NMEA children
+        ttk.Separator(msg, orient="horizontal").grid(row=2, column=0, columnspan=6, sticky="ew", pady=(6, 6))
 
-        # === NMEA group: master + children in the same grid ===
+        # -- NMEA master + 3-column children --
         self.nmea_master_var = tk.BooleanVar(value=False)
-        self.nmea_group = ttk.Frame(msg)
-        self.nmea_group.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(0, 2))
+        self.nmea_group = ttk.Frame(msg); self.nmea_group.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(0, 2))
         for c in range(6):
             self.nmea_group.grid_columnconfigure(c, minsize=180)
-
         self.nmea_master_chk = ttk.Checkbutton(
             self.nmea_group, text="Enable NMEA messages",
             variable=self.nmea_master_var, command=self._on_master_toggled
         )
         self.nmea_master_chk.grid(row=0, column=0, sticky="w")
-
-        ttk.Separator(self.nmea_group, orient="horizontal").grid(
-            row=1, column=0, columnspan=6, sticky="ew", pady=(4, 6)
-        )
+        ttk.Separator(self.nmea_group, orient="horizontal").grid(row=1, column=0, columnspan=6, sticky="ew", pady=(4, 6))
 
         self.nmea_vars: Dict[str, tk.BooleanVar] = {}
         self.nmea_rate_labels: Dict[str, ttk.Label] = {}
 
-        def add_nmea_cell(parent, row: int, col_pair: int, name: str, text: str):
+        def add_nmea_cell(parent, row: int, col_pair: int, key: str, label: str):
             var = tk.BooleanVar(value=False)
             def on_child():
                 if not self.nmea_master_var.get():
                     self.nmea_master_var.set(True)
                 self._on_any_setting_changed()
-            chk = ttk.Checkbutton(parent, text=text, variable=var, command=on_child)
+            chk = ttk.Checkbutton(parent, text=label, variable=var, command=on_child)
             lbl = ttk.Label(parent, text="", font=self.mono_font, width=16)
             c = col_pair * 2
-            chk.grid(row=row, column=c, sticky="w")
-            lbl.grid(row=row, column=c + 1, sticky="w")
-            self.nmea_vars[name] = var
-            self.nmea_rate_labels[name] = lbl
+            chk.grid(row=row, column=c, sticky="w"); lbl.grid(row=row, column=c + 1, sticky="w")
+            self.nmea_vars[key] = var; self.nmea_rate_labels[key] = lbl
 
         add_nmea_cell(self.nmea_group, 2, 0, "gga", "NMEA GGA")
         add_nmea_cell(self.nmea_group, 2, 1, "gll", "NMEA GLL")
@@ -815,7 +743,7 @@ class SimulatorGUI:
         add_nmea_cell(self.nmea_group, 3, 1, "rmc", "NMEA RMC")
         add_nmea_cell(self.nmea_group, 3, 2, "vtg", "NMEA VTG")
 
-        # --- Profile settings (table + active profile) ---
+        # ==== Profile settings (table) + Active profile (with progress bar) ====
         prof_set = ttk.LabelFrame(root, text="Profile settings", padding=8)
         prof_set.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
         headers = ["Enable", "Profile", "Min (km/h)", "Max (km/h)", "Duration (s)"]
@@ -826,64 +754,89 @@ class SimulatorGUI:
 
         self.profile_rows = {}
 
-        def add_profile_row(r, name, enabled, mn, mx, dur, lock_minmax=False):
-            en_var = tk.BooleanVar(value=enabled)
-            chk = ttk.Checkbutton(prof_set, variable=en_var, command=self._on_any_setting_changed)
-            chk.grid(row=r, column=0, sticky="w")
+        def parse_int_str(s: str) -> int:
+            if s is None: return 0
+            s = str(s).strip().replace(",", ".")
+            try:
+                # Only integers are allowed; clamp at 0
+                v = int(float(s))
+            except ValueError:
+                v = 0
+            return max(0, v)
+
+        def add_profile_row(r, name, mn, mx, dur, lock_minmax=False):
+            en = tk.BooleanVar(value=(dur > 0))
+            mn_v, mx_v = tk.StringVar(value=str(mn)), tk.StringVar(value=str(mx))
+            dur_v = tk.StringVar(value=str(dur))
+
+            def on_en_toggled():
+                # master checkbox mirrors duration: tick -> set default if 0; untick -> set 0
+                cur = parse_int_str(dur_v.get())
+                if en.get():
+                    if cur == 0:
+                        dur_v.set(str(self.DEFAULT_DUR.get(name, 5)))
+                else:
+                    dur_v.set("0")
+                self._on_any_setting_changed()
+
+            def on_duration_changed(*_):
+                v = parse_int_str(dur_v.get())
+                en.set(v > 0)  # checkbox mirrors duration
+                self._on_any_setting_changed()
+
+            ttk.Checkbutton(prof_set, variable=en, command=on_en_toggled).grid(row=r, column=0, sticky="w")
             ttk.Label(prof_set, text=name).grid(row=r, column=1, sticky="w")
 
-            mn_var = tk.StringVar(value=str(mn))
-            mx_var = tk.StringVar(value=str(mx))
-            du_var = tk.StringVar(value=str(dur))
-
-            e1 = ttk.Entry(prof_set, textvariable=mn_var, width=12, state=("disabled" if lock_minmax else "normal"))
-            e2 = ttk.Entry(prof_set, textvariable=mx_var, width=12, state=("disabled" if lock_minmax else "normal"))
-            e3 = ttk.Entry(prof_set, textvariable=du_var, width=14)
-
-            e1.grid(row=r, column=2, sticky="w")
-            e2.grid(row=r, column=3, sticky="w")
-            e3.grid(row=r, column=4, sticky="w")
-            e3.bind("<KeyRelease>", self._on_any_setting_changed)
+            e1 = ttk.Entry(prof_set, textvariable=mn_v, width=12, state=("disabled" if lock_minmax else "normal"))
+            e2 = ttk.Entry(prof_set, textvariable=mx_v, width=12, state=("disabled" if lock_minmax else "normal"))
+            e1.grid(row=r, column=2, sticky="w"); e2.grid(row=r, column=3, sticky="w")
             if not lock_minmax:
                 e1.bind("<KeyRelease>", self._on_any_setting_changed)
                 e2.bind("<KeyRelease>", self._on_any_setting_changed)
-            self.profile_rows[name] = (en_var, mn_var, mx_var, du_var)
+
+            # Spinbox for duration (integer seconds, min 0)
+            sb = tk.Spinbox(
+                prof_set, from_=0, to=86400, increment=1,
+                width=8, textvariable=dur_v, command=on_duration_changed,
+                justify="left"
+            )
+            sb.grid(row=r, column=4, sticky="w")
+            sb.bind("<KeyRelease>", on_duration_changed)
+
+            self.profile_rows[name] = (en, mn_v, mx_v, dur_v, sb)
 
         rows = [
-            ("STATIONARY", True, 0, 0, 5.0, True),
-            ("WALKING", True, 1, 8, 5.0, False),
-            ("CITY_DRIVING", True, 10, 60, 5.0, False),
-            ("HIGHWAY_DRIVING", True, 60, 100, 5.0, False),
-            ("HIGH_SPEED", True, 100, 399, 5.0, False),
-            ("NO_FIX", True, -1, -1, 5.0, True),
-            ("GPS_DISABLE", True, -2, -2, 10.0, True),
+            ("STATIONARY", 0,   0,   self.DEFAULT_DUR["STATIONARY"], True),
+            ("WALKING",    1,   8,   self.DEFAULT_DUR["WALKING"], False),
+            ("CITY_DRIVING", 10, 60, self.DEFAULT_DUR["CITY_DRIVING"], False),
+            ("HIGHWAY_DRIVING", 60, 100, self.DEFAULT_DUR["HIGHWAY_DRIVING"], False),
+            ("HIGH_SPEED", 100, 399, self.DEFAULT_DUR["HIGH_SPEED"], False),
+            ("NO_FIX",     -1, -1,  self.DEFAULT_DUR["NO_FIX"], True),
+            ("GPS_DISABLE",-2, -2,  self.DEFAULT_DUR["GPS_DISABLE"], True),
         ]
-        for i, (n, e, mn, mx, du, lock) in enumerate(rows, start=1):
-            add_profile_row(i, n, e, mn, mx, du, lock_minmax=lock)
+        for i, (n, mn, mx, du, lock) in enumerate(rows, start=1):
+            add_profile_row(i, n, mn, mx, du, lock_minmax=lock)
 
-        # Active profile inside Profile settings
+        # Active profile label + progress (data-driven)
         style = ttk.Style()
         style.configure("Profile.Normal.Horizontal.TProgressbar", troughcolor="#f0f0f0")
         style.configure("Profile.Lost.Horizontal.TProgressbar", troughcolor="#f0f0f0", background="#9e9e9e")
 
-        prof_set.grid_rowconfigure(len(rows) + 1, minsize=12)
+        base_row = len(rows) + 2
         self.active_prof_label = ttk.Label(prof_set, text="Active profile:", font=self.active_prof_font, width=16, anchor="w")
-        self.active_prof_value = ttk.Label(prof_set, text="—", font=self.active_prof_font, width=20, anchor="w")
+        self.active_prof_value = ttk.Label(prof_set, text="—", font=self.active_prof_font, width=22, anchor="w")
         self.active_prog = ttk.Progressbar(
             prof_set, orient="horizontal", mode="determinate",
-            maximum=1000, value=0,
-            style="Profile.Normal.Horizontal.TProgressbar",
+            maximum=1000, value=0, style="Profile.Normal.Horizontal.TProgressbar",
         )
-        base_row = len(rows) + 2
         self.active_prof_label.grid(row=base_row, column=0, sticky="w", pady=(6, 0))
         self.active_prof_value.grid(row=base_row, column=1, sticky="w", pady=(6, 0))
         self.active_prog.grid(row=base_row, column=2, columnspan=3, sticky="ew", pady=(6, 0))
 
-        # --- Current status (fixed columns) ---
+        # ==== Current status ====
         stat = ttk.LabelFrame(root, text="Current status", padding=8)
         stat.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
-        for i in range(6):
-            stat.grid_columnconfigure(i, minsize=190)
+        for i in range(6): stat.grid_columnconfigure(i, minsize=190)
 
         self.lbl_speed_big = ttk.Label(stat, text="Speed: —", font=self.big_speed_font)
         self.lbl_speed_big.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
@@ -897,20 +850,15 @@ class SimulatorGUI:
         self.lbl_time_loc = mono_label(stat, "Time (Local): —", 1, 1)
         self.lbl_heading  = mono_label(stat, "Heading: —°", 2, 1)
         self.lbl_sats     = mono_label(stat, "Sats: —", 3, 1)
-
-        # FIX text label (color-coded & descriptive)
         self.lbl_fix_status = ttk.Label(stat, text="FIX: —", font=("Segoe UI", 11, "bold"), foreground=self.col_gray)
         self.lbl_fix_status.grid(row=1, column=4, sticky="w")
-
         self.lbl_lat      = mono_label(stat, "Lat: —", 0, 2)
         self.lbl_lon      = mono_label(stat, "Lon: —", 1, 2)
 
-        # --- Buttons row ---
+        # ==== Buttons ====
         btns = ttk.Frame(root, padding=(8, 0, 8, 8))
         btns.grid(row=4, column=0, sticky="ew")
-        for c, w in enumerate([160, 200, 360]):
-            btns.grid_columnconfigure(c, minsize=w)
-
+        for c, w in enumerate([160, 200, 360]): btns.grid_columnconfigure(c, minsize=w)
         self.start_btn = ttk.Button(btns, text="Start", command=self.start_sim, state="disabled")
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop_sim, state="disabled")
         self.apply_btn = ttk.Button(btns, text="Apply to running (reset)", command=self.apply_to_running, state="disabled")
@@ -918,19 +866,17 @@ class SimulatorGUI:
         self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         self.apply_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
-        # --- TX Monitor (auto-height) ---
+        # ==== TX Monitor ====
         monitor = ttk.LabelFrame(root, text="TX Monitor (latest)", padding=8)
         monitor.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
         monitor.grid_columnconfigure(0, weight=1)
 
+        # UBX
         ttk.Label(monitor, text="UBX (hex):").grid(row=0, column=0, sticky="w")
-        ubx_frame = ttk.Frame(monitor)
-        ubx_frame.grid(row=1, column=0, sticky="ew")
+        ubx_frame = ttk.Frame(monitor); ubx_frame.grid(row=1, column=0, sticky="ew")
         ubx_frame.grid_columnconfigure(0, weight=1)
         self.ubx_tree = ttk.Treeview(ubx_frame, columns=("msg", "len", "hex"), show="headings", height=1)
-        self.ubx_tree.heading("msg", text="Message")
-        self.ubx_tree.heading("len", text="Bytes")
-        self.ubx_tree.heading("hex", text="Hex (no spaces)")
+        self.ubx_tree.heading("msg", text="Message"); self.ubx_tree.heading("len", text="Bytes"); self.ubx_tree.heading("hex", text="Hex (no spaces)")
         self.ubx_tree.column("msg", width=160, anchor="w", stretch=False)
         self.ubx_tree.column("len", width=70, anchor="center", stretch=False)
         self.ubx_tree.column("hex", width=800, anchor="w", stretch=True)
@@ -938,26 +884,23 @@ class SimulatorGUI:
         ubx_vsb = ttk.Scrollbar(ubx_frame, orient="vertical", command=self.ubx_tree.yview)
         ubx_hsb = ttk.Scrollbar(ubx_frame, orient="horizontal", command=self.ubx_tree.xview)
         self.ubx_tree.configure(yscroll=ubx_vsb.set, xscroll=ubx_hsb.set)
-        ubx_vsb.grid(row=0, column=1, sticky="ns")
-        ubx_hsb.grid(row=1, column=0, sticky="ew")
+        ubx_vsb.grid(row=0, column=1, sticky="ns"); ubx_hsb.grid(row=1, column=0, sticky="ew")
 
         ttk.Separator(monitor, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=(4, 8))
 
+        # NMEA
         ttk.Label(monitor, text="NMEA (text):").grid(row=3, column=0, sticky="w")
-        nmea_frame = ttk.Frame(monitor)
-        nmea_frame.grid(row=4, column=0, sticky="ew")
+        nmea_frame = ttk.Frame(monitor); nmea_frame.grid(row=4, column=0, sticky="ew")
         nmea_frame.grid_columnconfigure(0, weight=1)
         self.nmea_tree = ttk.Treeview(nmea_frame, columns=("msg", "text"), show="headings", height=1)
-        self.nmea_tree.heading("msg", text="Message")
-        self.nmea_tree.heading("text", text="Sentence")
+        self.nmea_tree.heading("msg", text="Message"); self.nmea_tree.heading("text", text="Sentence")
         self.nmea_tree.column("msg", width=160, anchor="w", stretch=False)
         self.nmea_tree.column("text", width=970, anchor="w", stretch=True)
         self.nmea_tree.grid(row=0, column=0, sticky="ew")
         nmea_vsb = ttk.Scrollbar(nmea_frame, orient="vertical", command=self.nmea_tree.yview)
         nmea_hsb = ttk.Scrollbar(nmea_frame, orient="horizontal", command=self.nmea_tree.xview)
         self.nmea_tree.configure(yscroll=nmea_vsb.set, xscroll=nmea_hsb.set)
-        nmea_vsb.grid(row=0, column=1, sticky="ns")
-        nmea_hsb.grid(row=1, column=0, sticky="ew")
+        nmea_vsb.grid(row=0, column=1, sticky="ns"); nmea_hsb.grid(row=1, column=0, sticky="ew")
 
         # Context menus (copy)
         self._build_context_menus()
@@ -967,16 +910,16 @@ class SimulatorGUI:
         self._update_start_btn_state()
         self._rebuild_tx_tables()
 
-        # Timers to drain queues (profile at ~60fps)
+        # Queue drainers
         self.root.after(120, self._drain_rate_queue)
-        self.root.after(16, self._drain_profile_queue)
+        self.root.after(30,  self._drain_profile_queue)  # 30ms is fine for direct updates
         self.root.after(120, self._drain_stats_queue)
-        self.root.after(80, self._drain_tx_queue)
+        self.root.after(80,  self._drain_tx_queue)
 
-        # Ensure trees render immediately
+        # Ensure treeviews render once on start
         self.root.after(50, self._force_refresh_treeviews)
 
-    # ----- context menus -----
+    # ---------- Context menus ----------
     def _build_context_menus(self):
         self.ubx_menu = tk.Menu(self.root, tearoff=0)
         self.ubx_menu.add_command(label="Copy Payload", command=self._copy_selected_ubx)
@@ -998,61 +941,45 @@ class SimulatorGUI:
 
     def _popup_ubx_menu(self, event):
         iid = self.ubx_tree.identify_row(event.y)
-        if iid:
-            self.ubx_tree.selection_set(iid)
+        if iid: self.ubx_tree.selection_set(iid)
         self.ubx_menu.tk_popup(event.x_root, event.y_root)
 
     def _popup_nmea_menu(self, event):
         iid = self.nmea_tree.identify_row(event.y)
-        if iid:
-            self.nmea_tree.selection_set(iid)
+        if iid: self.nmea_tree.selection_set(iid)
         self.nmea_menu.tk_popup(event.x_root, event.y_root)
 
-    # ----- copy helpers -----
+    # ---------- Copy helpers ----------
     def _copy_selected_ubx(self):
         sel = self.ubx_tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        vals = self.ubx_tree.item(iid, "values")
-        payload = vals[2] if len(vals) >= 3 else ""
+        if not sel: return
+        payload = self.ubx_tree.item(sel[0], "values")[2]
         self._to_clipboard(payload)
 
     def _copy_selected_ubx_row(self):
         sel = self.ubx_tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        vals = self.ubx_tree.item(iid, "values")
+        if not sel: return
+        vals = self.ubx_tree.item(sel[0], "values")
         self._to_clipboard(",".join(vals))
 
     def _copy_all_ubx(self):
-        lines = []
-        for iid in self.ubx_tree.get_children():
-            lines.append(",".join(self.ubx_tree.item(iid, "values")))
+        lines = [",".join(self.ubx_tree.item(iid, "values")) for iid in self.ubx_tree.get_children()]
         self._to_clipboard("\n".join(lines))
 
     def _copy_selected_nmea(self):
         sel = self.nmea_tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        vals = self.nmea_tree.item(iid, "values")
-        payload = vals[1] if len(vals) >= 2 else ""
+        if not sel: return
+        payload = self.nmea_tree.item(sel[0], "values")[1]
         self._to_clipboard(payload)
 
     def _copy_selected_nmea_row(self):
         sel = self.nmea_tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        vals = self.nmea_tree.item(iid, "values")
+        if not sel: return
+        vals = self.nmea_tree.item(sel[0], "values")
         self._to_clipboard(",".join(vals))
 
     def _copy_all_nmea(self):
-        lines = []
-        for iid in self.nmea_tree.get_children():
-            lines.append(",".join(self.nmea_tree.item(iid, "values")))
+        lines = [",".join(self.nmea_tree.item(iid, "values")) for iid in self.nmea_tree.get_children()]
         self._to_clipboard("\n".join(lines))
 
     def _to_clipboard(self, text: str):
@@ -1062,7 +989,7 @@ class SimulatorGUI:
         except Exception:
             pass
 
-    # ----- utilities -----
+    # ---------- Tree utilities ----------
     def _force_refresh_treeviews(self):
         self.ubx_tree.update_idletasks()
         self.nmea_tree.update_idletasks()
@@ -1078,37 +1005,33 @@ class SimulatorGUI:
         self.nmea_tree.configure(height=max(1, nmea_count))
 
     def _rebuild_tx_tables(self):
+        # Clear & rebuild rows to exactly match enabled messages
         for tree in (self.ubx_tree, self.nmea_tree):
             for iid in tree.get_children():
                 tree.delete(iid)
 
         if self.ubx_master_var.get():
-            if self.pvt_var.get():
-                self.ubx_tree.insert("", "end", iid="pvt", values=("UBX-NAV-PVT", "", ""))
-            if self.vel_var.get():
-                self.ubx_tree.insert("", "end", iid="velned", values=("UBX-NAV-VELNED", "", ""))
-            if self.sol_var.get():
-                self.ubx_tree.insert("", "end", iid="sol", values=("UBX-NAV-SOL", "", ""))
+            if self.pvt_var.get():   self.ubx_tree.insert("", "end", iid="pvt",    values=("UBX-NAV-PVT",    "", ""))
+            if self.vel_var.get():   self.ubx_tree.insert("", "end", iid="velned", values=("UBX-NAV-VELNED", "", ""))
+            if self.sol_var.get():   self.ubx_tree.insert("", "end", iid="sol",    values=("UBX-NAV-SOL",    "", ""))
 
         if self.nmea_master_var.get():
-            for key, label in (
-                ("gga", "NMEA GGA"), ("gll", "NMEA GLL"), ("gsa", "NMEA GSA"),
-                ("gsv", "NMEA GSV"), ("rmc", "NMEA RMC"), ("vtg", "NMEA VTG"),
-            ):
+            for key, label in (("gga","NMEA GGA"), ("gll","NMEA GLL"), ("gsa","NMEA GSA"),
+                               ("gsv","NMEA GSV"), ("rmc","NMEA RMC"), ("vtg","NMEA VTG")):
                 if self.nmea_vars.get(key, tk.BooleanVar()).get():
                     self.nmea_tree.insert("", "end", iid=key, values=(label, ""))
 
         self._set_tx_heights()
         self._force_refresh_treeviews()
-        self._auto_resize_to_fit()  # action-triggered auto-resize
+        self._auto_resize_to_fit()
 
     def _clear_status_and_tx(self):
-        # reset colors & progress animation
+        # Reset colors
         self._set_status_area_color(self.col_text, include_fix=True)
-        self._prog_value = 0.0
-        self._prog_target = 0.0
-        self._prog_last_t = time.perf_counter()
+        self._last_profile_seq = None
+        self.active_prog["value"] = 0
 
+        # Status text reset
         self.lbl_speed_big.config(text="Speed: —")
         self.lbl_time_utc.config(text="Time (UTC): —")
         self.lbl_time_loc.config(text="Time (Local): —")
@@ -1118,40 +1041,28 @@ class SimulatorGUI:
         self.lbl_lat.config(text="Lat: —")
         self.lbl_lon.config(text="Lon: —")
         self.active_prof_value.config(text="—")
-        self.active_prog["value"] = 0
 
+        # Clear current TX values
         for iid in self.ubx_tree.get_children():
-            vals = list(self.ubx_tree.item(iid, "values"))
-            vals[1] = ""  # len
-            vals[2] = ""  # hex
-            self.ubx_tree.item(iid, values=vals)
+            self.ubx_tree.item(iid, values=(self.ubx_tree.item(iid, "values")[0], "", ""))
         for iid in self.nmea_tree.get_children():
-            vals = list(self.nmea_tree.item(iid, "values"))
-            vals[1] = ""  # sentence
-            self.nmea_tree.item(iid, values=vals)
-        self._force_refresh_treeviews()
+            self.nmea_tree.item(iid, values=(self.nmea_tree.item(iid, "values")[0], ""))
 
-    # ----- status area coloring helpers -----
+    # ---------- Status color helpers ----------
     def _set_status_area_color(self, color: str, include_fix: bool = False):
-        labels = [
-            self.lbl_speed_big, self.lbl_time_utc, self.lbl_time_loc,
-            self.lbl_heading, self.lbl_sats, self.lbl_lat, self.lbl_lon
-        ]
+        labels = [self.lbl_speed_big, self.lbl_time_utc, self.lbl_time_loc,
+                  self.lbl_heading, self.lbl_sats, self.lbl_lat, self.lbl_lon]
         for lbl in labels:
-            try:
-                lbl.configure(foreground=color)
-            except Exception:
-                pass
+            try: lbl.configure(foreground=color)
+            except Exception: pass
         if include_fix:
-            try:
-                self.lbl_fix_status.configure(foreground=color)
-            except Exception:
-                pass
+            try: self.lbl_fix_status.configure(foreground=color)
+            except Exception: pass
 
     def _reset_status_area_basecolor(self):
         self._set_status_area_color(self.col_text, include_fix=False)
 
-    # ----- auto-resize window ON ACTION -----
+    # ---------- One-shot auto-resize (no jitter) ----------
     def _auto_resize_to_fit(self):
         try:
             ubx_rows = max(1, sum([
@@ -1170,7 +1081,7 @@ class SimulatorGUI:
         except Exception:
             pass
 
-    # ----- dirty / master / start enable -----
+    # ---------- Dirty & start-enable logic ----------
     def _mark_dirty(self, dirty=True):
         self._dirty = bool(dirty)
         self.apply_btn.configure(state=("normal" if (self.sim_running and self._dirty) else "disabled"))
@@ -1181,22 +1092,16 @@ class SimulatorGUI:
         self._rebuild_tx_tables()
 
     def _on_master_toggled(self):
+        # Untick children if master unticked. Child tick re-ticks master (handled in child handlers).
         if not self.ubx_master_var.get():
-            self.pvt_var.set(False)
-            self.vel_var.set(False)
-            self.sol_var.set(False)
+            self.pvt_var.set(False); self.vel_var.set(False); self.sol_var.set(False)
         if not self.nmea_master_var.get():
-            for v in self.nmea_vars.values():
-                v.set(False)
-        self._mark_dirty(True)
-        self._update_start_btn_state()
-        self._rebuild_tx_tables()
+            for v in self.nmea_vars.values(): v.set(False)
+        self._on_any_setting_changed()
 
     def _on_port_selected(self, *_):
-        has_port = bool(self.port_var.get().strip())
-        self.baud_cb.configure(state=("readonly" if has_port else "disabled"))
-        self._mark_dirty(True)
-        self._update_start_btn_state()
+        self.baud_cb.configure(state=("readonly" if bool(self.port_var.get().strip()) else "disabled"))
+        self._on_any_setting_changed()
 
     def _has_any_message_selected(self) -> bool:
         any_ubx = self.ubx_master_var.get() and (self.pvt_var.get() or self.vel_var.get() or self.sol_var.get())
@@ -1205,45 +1110,34 @@ class SimulatorGUI:
 
     def _update_start_btn_state(self):
         if self.sim_running:
-            self.start_btn.configure(state="disabled")
-            return
+            self.start_btn.configure(state="disabled"); return
         cfg_ok = self._current_config(validate_messages=False) is not None
-        has_msgs = self._has_any_message_selected()
-        self.start_btn.configure(state=("normal" if (cfg_ok and has_msgs) else "disabled"))
+        self.start_btn.configure(state=("normal" if (cfg_ok and self._has_any_message_selected()) else "disabled"))
 
-    # ----- config -----
+    # ---------- Config build ----------
     def refresh_ports(self):
         if serial is None:
-            self.port_cb["values"] = []
-            self.port_var.set("")
-            self.baud_cb.configure(state="disabled")
-            return
+            self.port_cb["values"] = []; self.port_var.set(""); self.baud_cb.configure(state="disabled"); return
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.port_cb["values"] = ports
-        # Keep blank until user picks one
         if self.port_var.get() not in ports:
-            self.port_var.set("")
-            self.baud_cb.configure(state="disabled")
+            self.port_var.set(""); self.baud_cb.configure(state="disabled")
 
     def _current_config(self, validate_messages: bool = True) -> Optional[dict]:
         port = self.port_var.get().strip()
-        if not port:
-            return None
+        if not port: return None
+        try: baudrate = int(self.baud_var.get())
+        except ValueError: return None
         try:
-            baudrate = int(self.baud_var.get())
-        except ValueError:
-            return None
-        try:
-            hz = float(self.hz_var.get())
-            if hz <= 0:
-                raise ValueError
+            hz = float(self.hz_var.get().replace(",", "."))
+            if hz <= 0: raise ValueError
         except ValueError:
             return None
 
         ubx_enable = {
-            "pvt": bool(self.pvt_var.get()) if self.ubx_master_var.get() else False,
-            "velned": bool(self.vel_var.get()) if self.ubx_master_var.get() else False,
-            "sol": bool(self.sol_var.get()) if self.ubx_master_var.get() else False,
+            "pvt":   bool(self.pvt_var.get())   if self.ubx_master_var.get() else False,
+            "velned":bool(self.vel_var.get())   if self.ubx_master_var.get() else False,
+            "sol":   bool(self.sol_var.get())   if self.ubx_master_var.get() else False,
         }
         nmea_enable = {k: (bool(v.get()) if self.nmea_master_var.get() else False) for k, v in self.nmea_vars.items()}
 
@@ -1251,13 +1145,14 @@ class SimulatorGUI:
             return None
 
         profiles = {}
-        for name, (en_v, mn_v, mx_v, du_v) in self.profile_rows.items():
+        for name, (en_v, mn_v, mx_v, du_v, _sb) in self.profile_rows.items():
             try:
+                dur = max(0, int(float(du_v.get().replace(",", "."))))
+                # Enabled derived from duration > 0 (checkbox mirrors this already)
                 profiles[name] = {
-                    "enabled": bool(en_v.get()),
-                    "min": float(mn_v.get()),
-                    "max": float(mx_v.get()),
-                    "duration": max(0.1, float(du_v.get())),
+                    "min": float(mn_v.get().replace(",", ".")),
+                    "max": float(mx_v.get().replace(",", ".")),
+                    "duration": dur,  # integer seconds
                 }
             except ValueError:
                 messagebox.showerror("Error", f"Invalid numbers in profile '{name}'.")
@@ -1272,18 +1167,19 @@ class SimulatorGUI:
             "profiles": profiles,
         }
 
-    # ----- queue draining -----
+    # ---------- Queue drainers ----------
     def _drain_rate_queue(self):
         try:
             while True:
                 rates = self.rate_queue.get_nowait()
                 if self.sim_running:
-                    self.pvt_rate.config(text=(f"act: {rates.get('pvt', 0.0):.2f} Hz" if self.pvt_var.get() and self.ubx_master_var.get() else ""))
-                    self.vel_rate.config(text=(f"act: {rates.get('velned', 0.0):.2f} Hz" if self.vel_var.get() and self.ubx_master_var.get() else ""))
-                    self.sol_rate.config(text=(f"act: {rates.get('sol', 0.0):.2f} Hz" if self.sol_var.get() and self.ubx_master_var.get() else ""))
-                    for key in ("gga", "gll", "gsa", "gsv", "rmc", "vtg"):
-                        lbl = self.nmea_rate_labels.get(key)
-                        var = self.nmea_vars.get(key)
+                    # UBX
+                    self.pvt_rate.config(text=(f"act: {rates.get('pvt', 0.0):.2f} Hz"     if self.pvt_var.get()   and self.ubx_master_var.get() else ""))
+                    self.vel_rate.config(text=(f"act: {rates.get('velned', 0.0):.2f} Hz"  if self.vel_var.get()   and self.ubx_master_var.get() else ""))
+                    self.sol_rate.config(text=(f"act: {rates.get('sol', 0.0):.2f} Hz"     if self.sol_var.get()   and self.ubx_master_var.get() else ""))
+                    # NMEA
+                    for key in ("gga","gll","gsa","gsv","rmc","vtg"):
+                        lbl, var = self.nmea_rate_labels.get(key), self.nmea_vars.get(key)
                         if lbl is not None and var is not None:
                             lbl.config(text=(f"act: {rates.get(key, 0.0):.2f} Hz" if var.get() and self.nmea_master_var.get() else ""))
         except queue.Empty:
@@ -1291,26 +1187,39 @@ class SimulatorGUI:
         self.root.after(120, self._drain_rate_queue)
 
     def _drain_profile_queue(self):
+        # Keep only the newest profile item each tick
+        info = None
         try:
             while True:
                 info = self.profile_queue.get_nowait()
-                if self.sim_running:
-                    self._current_is_lost = bool(info.get("is_lost", False))
-                    self._current_profile_name = info.get("name", "—")
-                    self.active_prof_value.config(text=self._current_profile_name)
-
-                    # target progress 0..1 for animator
-                    t = float(info.get("progress", 0.0))
-                    self._prog_target = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-
-                    # style applied by animator; keep in sync here too
-                    self.active_prog.configure(
-                        style=("Profile.Lost.Horizontal.TProgressbar" if self._current_is_lost
-                               else "Profile.Normal.Horizontal.TProgressbar")
-                    )
         except queue.Empty:
             pass
-        self.root.after(16, self._drain_profile_queue)  # ~60fps feed
+        if info is not None and self.sim_running:
+            # Detect profile switch via seq -> reset bar to 0
+            seq = info.get("seq")
+            if seq is not None and seq != self._last_profile_seq:
+                self._last_profile_seq = seq
+                self.active_prog["value"] = 0
+
+            # Update active profile label and set progress directly
+            self._current_is_lost = bool(info.get("is_lost", False))
+            self._current_profile_name = info.get("name", "—")
+            self.active_prof_value.config(text=self._current_profile_name)
+
+            self.active_prog.configure(
+                style=("Profile.Lost.Horizontal.TProgressbar" if self._current_is_lost
+                       else "Profile.Normal.Horizontal.TProgressbar")
+            )
+
+            p = info.get("progress", 0.0)
+            try:
+                p = float(p)
+            except Exception:
+                p = 0.0
+            p = 0.0 if p < 0.0 else (1.0 if p > 1.0 else p)
+            self.active_prog["value"] = int(p * 1000)
+
+        self.root.after(30, self._drain_profile_queue)
 
     def _set_fix_text(self, text: str, color: str):
         self.lbl_fix_status.configure(text=text, foreground=color)
@@ -1319,47 +1228,52 @@ class SimulatorGUI:
         try:
             while True:
                 s = self.stats_queue.get_nowait()
-                if self.sim_running:
-                    prof = self._current_profile_name
-                    if prof == "GPS_DISABLE":
-                        und = self.UND
-                        self.lbl_speed_big.config(text=f"Speed: {und}")
-                        self.lbl_time_utc.config(text=f"Time (UTC): {und}")
-                        self.lbl_time_loc.config(text=f"Time (Local): {und}")
-                        self.lbl_heading.config(text=f"Heading: {und}")
-                        self.lbl_sats.config(text=f"Sats: {und}")
-                        self.lbl_lat.config(text=f"Lat: {und}")
-                        self.lbl_lon.config(text=f"Lon: {und}")
-                        self._set_fix_text("FIX: GPS DISABLED", self.col_gray)
-                        self._set_status_area_color(self.col_gray, include_fix=True)
-                    elif prof == "NO_FIX":
-                        und = self.UND
-                        self.lbl_speed_big.config(text=f"Speed: {und}")
-                        self.lbl_time_utc.config(text=f"Time (UTC): {und}")
-                        self.lbl_time_loc.config(text=f"Time (Local): {und}")
-                        self.lbl_heading.config(text=f"Heading: {und}")
-                        self.lbl_sats.config(text=f"Sats: {int(s.get('sats', 0))}")
-                        self.lbl_lat.config(text=f"Lat: {und}")
-                        self.lbl_lon.config(text=f"Lon: {und}")
-                        self._reset_status_area_basecolor()
-                        self._set_fix_text("FIX: NO FIX", self.col_red)
+                if not self.sim_running: continue
+                prof = self._current_profile_name
+                if prof == "GPS_DISABLE":
+                    und = self.UND
+                    for lbl, txt in (
+                        (self.lbl_speed_big, f"Speed: {und}"),
+                        (self.lbl_time_utc, f"Time (UTC): {und}"),
+                        (self.lbl_time_loc, f"Time (Local): {und}"),
+                        (self.lbl_heading,  f"Heading: {und}"),
+                        (self.lbl_sats,     f"Sats: {und}"),
+                        (self.lbl_lat,      f"Lat: {und}"),
+                        (self.lbl_lon,      f"Lon: {und}"),
+                    ):
+                        lbl.config(text=txt)
+                    self._set_fix_text("FIX: GPS DISABLED", self.col_gray)
+                    self._set_status_area_color(self.col_gray, include_fix=True)
+                elif prof == "NO_FIX":
+                    und = self.UND
+                    for lbl, txt in (
+                        (self.lbl_speed_big, f"Speed: {und}"),
+                        (self.lbl_time_utc, f"Time (UTC): {und}"),
+                        (self.lbl_time_loc, f"Time (Local): {und}"),
+                        (self.lbl_heading,  f"Heading: {und}"),
+                        (self.lbl_sats,     f"Sats: {und}"),
+                        (self.lbl_lat,      f"Lat: {und}"),
+                        (self.lbl_lon,      f"Lon: {und}"),
+                    ):
+                        lbl.config(text=txt)
+                    self._reset_status_area_basecolor()
+                    self._set_fix_text("FIX: NO FIX", self.col_red)
+                else:
+                    self._reset_status_area_basecolor()
+                    fx = int(s.get("fix", 0))
+                    self.lbl_speed_big.config(text=f"Speed: {s.get('speed', 0.0):.1f} km/h")
+                    self.lbl_time_utc.config(text=f"Time (UTC): {s.get('utc', '—')}")
+                    self.lbl_time_loc.config(text=f"Time (Local): {s.get('local', '—')}")
+                    self.lbl_heading.config(text=f"Heading: {s.get('heading', 0.0):.1f}°")
+                    self.lbl_sats.config(text=f"Sats: {int(s.get('sats', 0))}")
+                    self.lbl_lat.config(text=f"Lat: {s.get('lat', 0.0):.6f}")
+                    self.lbl_lon.config(text=f"Lon: {s.get('lon', 0.0):.6f}")
+                    if fx == 3:
+                        self._set_fix_text("FIX: 3D FIX", self.col_green)
+                    elif fx == 2:
+                        self._set_fix_text("FIX: 2D FIX", self.col_green)
                     else:
-                        self._reset_status_area_basecolor()
-                        spd = s.get("speed", 0.0)
-                        fx = int(s.get("fix", 0))
-                        self.lbl_speed_big.config(text=f"Speed: {spd:.1f} km/h")
-                        self.lbl_time_utc.config(text=f"Time (UTC): {s.get('utc', '—')}")
-                        self.lbl_time_loc.config(text=f"Time (Local): {s.get('local', '—')}")
-                        self.lbl_heading.config(text=f"Heading: {s.get('heading', 0.0):.1f}°")
-                        self.lbl_sats.config(text=f"Sats: {int(s.get('sats', 0))}")
-                        self.lbl_lat.config(text=f"Lat: {s.get('lat', 0.0):.6f}")
-                        self.lbl_lon.config(text=f"Lon: {s.get('lon', 0.0):.6f}")
-                        if fx == 3:
-                            self._set_fix_text("FIX: 3D FIX", self.col_green)
-                        elif fx == 2:
-                            self._set_fix_text("FIX: 2D FIX", self.col_green)
-                        else:
-                            self._set_fix_text("FIX: NO FIX", self.col_red)
+                        self._set_fix_text("FIX: NO FIX", self.col_red)
         except queue.Empty:
             pass
         self.root.after(120, self._drain_stats_queue)
@@ -1368,50 +1282,24 @@ class SimulatorGUI:
         try:
             while True:
                 nmea_map, ubx_map = self.tx_queue.get_nowait()
-                if self.sim_running:
-                    for key, label in (("pvt", "UBX-NAV-PVT"), ("velned", "UBX-NAV-VELNED"), ("sol", "UBX-NAV-SOL")):
-                        if key in ubx_map and key in self.ubx_tree.get_children():
-                            hexstr = ubx_map[key]
-                            bytelen = len(hexstr) // 2
-                            self.ubx_tree.item(key, values=(label, str(bytelen), hexstr))
-                    for key, label in (
-                        ("gga", "NMEA GGA"), ("gll", "NMEA GLL"), ("gsa", "NMEA GSA"),
-                        ("gsv", "NMEA GSV"), ("rmc", "NMEA RMC"), ("vtg", "NMEA VTG"),
-                    ):
-                        if key in nmea_map and key in self.nmea_tree.get_children():
-                            self.nmea_tree.item(key, values=(label, nmea_map[key]))
+                if not self.sim_running: continue
+                # UBX (hex + computed byte length)
+                for key, label in (("pvt","UBX-NAV-PVT"), ("velned","UBX-NAV-VELNED"), ("sol","UBX-NAV-SOL")):
+                    if key in ubx_map and key in self.ubx_tree.get_children():
+                        hexstr = ubx_map[key]; bytelen = len(hexstr) // 2
+                        self.ubx_tree.item(key, values=(label, str(bytelen), hexstr))
+                # NMEA (text)
+                for key, label in (("gga","NMEA GGA"), ("gll","NMEA GLL"), ("gsa","NMEA GSA"),
+                                   ("gsv","NMEA GSV"), ("rmc","NMEA RMC"), ("vtg","NMEA VTG")):
+                    if key in nmea_map and key in self.nmea_tree.get_children():
+                        self.nmea_tree.item(key, values=(label, nmea_map[key]))
         except queue.Empty:
             pass
         self.root.after(80, self._drain_tx_queue)
 
-    # ----- 60fps animator for progressbar -----
-    def _animate_progress(self):
-        """60fps animator: ease progress value toward target using time-based smoothing."""
-        try:
-            now = time.perf_counter()
-            dt = max(0.0, min(0.1, now - self._prog_last_t))
-            self._prog_last_t = now
-
-            alpha = 1.0 - math.exp(-self._prog_alpha_per_s * dt)
-            self._prog_value += (self._prog_target - self._prog_value) * alpha
-
-            if abs(self._prog_target - self._prog_value) < 0.001:
-                self._prog_value = self._prog_target
-
-            self.active_prog["value"] = int(self._prog_value * 1000)
-            self.active_prog.configure(
-                style=("Profile.Lost.Horizontal.TProgressbar" if self._current_is_lost
-                       else "Profile.Normal.Horizontal.TProgressbar")
-            )
-        except Exception:
-            pass
-        finally:
-            self.root.after(16, self._animate_progress)
-
-    # ----- start / stop / apply -----
+    # ---------- Start / Stop / Apply ----------
     def start_sim(self):
-        if self.sim_running:
-            return
+        if self.sim_running: return
         cfg = self._current_config(validate_messages=True)
         if not cfg:
             messagebox.showerror("Error", "Invalid configuration or no messages selected.")
@@ -1421,54 +1309,40 @@ class SimulatorGUI:
         self._rebuild_tx_tables()
         self._clear_status_and_tx()
 
-        def rate_cb(r):   self.rate_queue.put(r)
-        def prof_cb(p):   self.profile_queue.put(p)
-        def stats_cb(s):  self.stats_queue.put(s)
-        def tx_cb(n, u):  self.tx_queue.put((n, u))
+        def rate_cb(r):  self.rate_queue.put(r)
+        def prof_cb(p):  self.profile_queue.put(p)
+        def stats_cb(s): self.stats_queue.put(s)
+        def tx_cb(n,u):  self.tx_queue.put((n, u))
 
         def worker():
             try:
-                sim = UbxNmeaSimulator(
-                    cfg,
-                    ctrl_q=self.ctrl_queue,
-                    rate_cb=rate_cb,
-                    profile_cb=prof_cb,
-                    stats_cb=stats_cb,
-                    tx_cb=tx_cb,
-                    stop_event=self.stop_event,
-                )
+                sim = UbxNmeaSimulator(cfg, self.ctrl_queue, rate_cb, prof_cb, stats_cb, tx_cb, self.stop_event)
                 sim.run()
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
             finally:
                 self.root.after(0, lambda: self._toggle_inputs(False))
 
-        self.sim_thread = threading.Thread(target=worker, daemon=True)
-        self.sim_thread.start()
+        self.sim_thread = threading.Thread(target=worker, daemon=True); self.sim_thread.start()
         self._last_applied_config = cfg
         self._mark_dirty(False)
         self._toggle_inputs(True)
         self._auto_resize_to_fit()
 
     def stop_sim(self):
-        if not self.sim_running:
-            return
-        self.stop_event.set()
-        # Keep last status & TX snapshot visible
+        if not self.sim_running: return
+        self.stop_event.set()  # snapshot remains visible
 
     def apply_to_running(self):
-        if not self.sim_running or not self._dirty:
-            return
+        if not self.sim_running or not self._dirty: return
         cfg = self._current_config(validate_messages=True)
         if not cfg:
-            messagebox.showerror("Error", "Invalid configuration or no messages selected.")
-            return
+            messagebox.showerror("Error", "Invalid configuration or no messages selected."); return
         self._rebuild_tx_tables()
         try:
             self.ctrl_queue.put_nowait({"cmd": "reset", "cfg": cfg})
         except Exception:
-            messagebox.showerror("Error", "Failed to queue apply-to-running request.")
-            return
+            messagebox.showerror("Error", "Failed to queue apply-to-running request."); return
         self._last_applied_config = cfg
         self._mark_dirty(False)
         self._auto_resize_to_fit()
@@ -1486,8 +1360,7 @@ class SimulatorGUI:
             if self.sim_running:
                 self.stop_event.set()
                 for _ in range(60):
-                    if self.sim_thread and not self.sim_thread.is_alive():
-                        break
+                    if self.sim_thread and not self.sim_thread.is_alive(): break
                     time.sleep(0.05)
         finally:
             self.root.destroy()
