@@ -1,20 +1,20 @@
 /**
  * ESP32 + SSD1306 + u-blox NAV‑PVT Speedometer (PlatformIO / Arduino)
- * Architecture:
- *   - Dual core: core1 = GPS I/O + parsing, core0 = UI + OLED
- *   - Dual snapshots: REALTIME (NAV‑PVT updates), COUNTER (1 Hz stats)
- *   - Auto-baud detect (UBX or NMEA), UBX config sender to 115200 + 10 Hz PVT
- * Performance:
- *   - UART RX 4KB, UBX framer buf 2KB, batch read for locality
- *   - Redraw only on content change or ≥200ms
+ * Dual-core + dual-snapshot design WITH:
+ *   - Auto-baud detect (UBX or NMEA) on GPS UART2
+ *   - UBX configuration sender (disable NMEA, enable NAV-PVT, 10 Hz, automotive model, set 115200 baud)
+ *   - Core 1 (gps_task): UART2 read, NMEA prefilter, UBX framer, update REALTIME snapshot on every PVT,
+ *                        and publish COUNTER snapshot every 1s.
+ *   - Core 0 (ui_task):  Reads REALTIME snapshot frequently for smooth UI (<=100ms), measures redraw_us,
+ *                        and reads COUNTER snapshot (1Hz) only for debug prints.
  *
- * NOTE: This file is reorganized by functional blocks with clearer comments.
- *       No behavior changes; only ordering and documentation.
+ * Optimizations kept:
+ *   - UART2 RX buffer 2048B, UBX framer buffer 2048B
+ *   - OLED redraw only on content change OR >= 100 ms
+ *   - Keep float thresholds for sAcc vs gSpeed (per user request)
+ *   - Disable WiFi/Bluetooth & free memory in setup()
+ *   - Force CPU 240 MHz at runtime (also set in platformio.ini)
  */
-
-/////////////////////
-// 1) INCLUDES & GLOBAL CONFIG
-/////////////////////
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -25,22 +25,15 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 
-#define DEBUG_PROFILE 1 // 1 = enable periodic serial stats (1 Hz)
-#define DEBUG_CPU 1     // 1 = enable CPU/RAM usage logs
+#define DEBUG_PROFILE 1
+#define DEBUG_CPU 1 // 1 = bật đo CPU/RAM, 0 = tắt
 
-// OLED
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-// Desired GPS baud after configuration
-static const uint32_t TARGET_BAUD = 115200;
-
-/////////////////////
-// 2) PINS & RUNTIME IDs
-/////////////////////
-
+// -------------------- Pins --------------------
 static const uint8_t PIN_RXD2 = 16; // GPS TX -> RXD2
 static const uint8_t PIN_TXD2 = 17; // GPS RX -> TXD2
 static const int PIN_BUTTON = 32;
@@ -48,14 +41,10 @@ static const int PIN_BUTTON = 32;
 static int coreIdGps = -1;
 static int coreIdUi = -1;
 
-/////////////////////
-// 3) CPU/RAM PROFILING (optional)
-/////////////////////
+// DEBUG CPU MEMORY
 #if DEBUG_CPU
 #include "esp_freertos_hooks.h"
 #include "esp_timer.h"
-
-// Idle counters for per-core load measurement
 static volatile uint32_t s_idleCnt[2] = {0, 0};
 static uint32_t s_idleCntLast[2] = {0, 0};
 static uint32_t s_idleBaseline[2] = {0, 0};
@@ -71,17 +60,18 @@ static bool idle_hook_core1(void)
   return true;
 }
 
-// Compute CPU load every 1s (0..100%)
+// static uint32_t s_uptimeSec = 0;
 static void computeCpuLoad1s(float outLoad[2])
 {
-  static uint32_t warmup = 2;  // learn baseline for first 2s
-  static float decay = 0.001f; // 0.1%/s baseline decay (keep baseline fresh)
+  static uint32_t warmup = 2;  // khóa baseline sau 2s
+  static float decay = 0.001f; // 0.1%/s, giúp baseline dần “thoáng” ra
 
   uint32_t d0 = s_idleCnt[0] - s_idleCntLast[0];
   uint32_t d1 = s_idleCnt[1] - s_idleCntLast[1];
   s_idleCntLast[0] = s_idleCnt[0];
   s_idleCntLast[1] = s_idleCnt[1];
 
+  // Học baseline trong warmup
   if (warmup)
   {
     if (d0 > s_idleBaseline[0])
@@ -89,7 +79,7 @@ static void computeCpuLoad1s(float outLoad[2])
     if (d1 > s_idleBaseline[1])
       s_idleBaseline[1] = d1;
     if (--warmup == 0)
-    {
+    { // khóa baseline
       if (!s_idleBaseline[0])
         s_idleBaseline[0] = d0 ? d0 : 1;
       if (!s_idleBaseline[1])
@@ -98,6 +88,7 @@ static void computeCpuLoad1s(float outLoad[2])
   }
   else
   {
+    // sau warmup: baseline = max(baseline*(1-decay), d)
     s_idleBaseline[0] = (uint32_t)max((float)s_idleBaseline[0] * (1.0f - decay), (float)d0);
     s_idleBaseline[1] = (uint32_t)max((float)s_idleBaseline[1] * (1.0f - decay), (float)d1);
   }
@@ -114,9 +105,10 @@ static void computeCpuLoad1s(float outLoad[2])
     l1 = 1;
   outLoad[0] = l0 * 100.0f;
   outLoad[1] = l1 * 100.0f;
+
+  // s_uptimeSec++;
 }
 
-// Heap/PSRAM usage in %
 static void getMemoryUsage(float &heapPct, float &psramPct, bool &hasPsram)
 {
   uint32_t heapTotal = ESP.getHeapSize();
@@ -134,65 +126,9 @@ static void getMemoryUsage(float &heapPct, float &psramPct, bool &hasPsram)
     psramPct = 0.0f;
   }
 }
-#endif // DEBUG_CPU
+#endif
 
-/////////////////////
-// 4) UBX NAV‑PVT STRUCT (binary layout)
-/////////////////////
-
-#pragma pack(push, 1)
-struct UbxNavPvt
-{
-  uint32_t iTOW;
-  uint16_t year;
-  uint8_t month, day, hour, minute, second, valid;
-  uint32_t tAcc;
-  int32_t nano;
-  uint8_t fixType, flags, flags2, numSV;
-  int32_t lon, lat, height, hMSL;
-  uint32_t hAcc, vAcc;
-  int32_t velN, velE, velD, gSpeed; // mm/s
-  int32_t headMot;
-  uint32_t sAcc;
-  uint32_t headAcc;
-  uint16_t pDOP;
-  uint8_t reserved1[6];
-  int32_t headVeh;
-  int16_t magDec;
-  uint16_t magAcc;
-};
-#pragma pack(pop)
-
-/////////////////////
-// 5) GLOBAL STATE & FORWARD DECLS
-/////////////////////
-#define GPS_LOST_TIMEOUT_MS 2200
-// Runtime flags
-static volatile bool g_running = true;
-
-// Last PVT & loss detection
-static UbxNavPvt g_lastPvt{};
-static uint32_t lastNavPvtTick = 0;
-static bool gpsLost = true;
-
-// Per-second counters (produced on core1, read on core0)
-volatile uint16_t ubxSeenPerSec = 0, ubxSeenLastSec = 0;
-volatile uint16_t pvtSeenPerSec = 0, pvtSeenLastSec = 0;
-volatile uint16_t pvtValidPerSec = 0, pvtValidLastSec = 0;
-volatile uint16_t nmeaPerSec = 0, nmeaLastSec = 0;
-
-// NAV‑PVT version counter (increments on each valid PVT)
-static volatile uint32_t g_pvtVer = 0;
-
-// Forward decls for snapshot helpers
-static void rt_write(const UbxNavPvt &pvt, bool lost, uint32_t ver);
-static void cnt_write(uint32_t ubx, uint32_t pvt, uint32_t valid, uint32_t nmea);
-
-/////////////////////
-// 6) ASSETS (icons, spinners)
-/////////////////////
-
-// 20x20 monochrome satellite icon
+// =============== Satellite icon ===============
 #define sat_logo_HEIGHT 20
 #define sat_logo_WIDTH 20
 static const uint8_t sat_logo[] PROGMEM = {
@@ -202,25 +138,16 @@ static const uint8_t sat_logo[] PROGMEM = {
     0x80, 0x4F, 0x06, 0x19, 0xC6, 0x03, 0x1B, 0x80, 0x01, 0x73, 0x00, 0x00,
     0x66, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x70, 0x00, 0x00};
 
-// Spinners & calibration
-static const char spinner[] = "/-\\|";
-static int speedCalibrationOffset = 0; // 0..5 km/h (UI button cycles)
+// Desired GPS baud after configuration
+static const uint32_t TARGET_BAUD = 115200;
 
-/////////////////////
-// 7) HARDWARE INSTANCES
-/////////////////////
-
+// -------------------- HW instances --------------------
 HardwareSerial GPS(2);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-/////////////////////
-// 8) AUTODETECT BAUD (UBX/NMEA)
-/////////////////////
-
-// Common baudrates to probe (order matters)
+// -------------------- Helpers for autodetect --------------------
 static int COMMON_BAUD_RATE[] = {38400, 115200, 230400, 460800, 9600};
 
-// Byte read with timeout
 static bool readByteWithTimeout(HardwareSerial &s, uint8_t &b, uint32_t ms)
 {
   uint32_t t0 = millis();
@@ -235,8 +162,6 @@ static bool readByteWithTimeout(HardwareSerial &s, uint8_t &b, uint32_t ms)
   }
   return false;
 }
-
-// Seek UBX sync (0xB5 0x62)
 static bool syncToUBX(HardwareSerial &s, uint32_t ms)
 {
   enum
@@ -264,8 +189,6 @@ static bool syncToUBX(HardwareSerial &s, uint32_t ms)
   }
   return false;
 }
-
-// Read a UBX frame header+payload and verify checksum quickly
 static bool readUBXValid(HardwareSerial &s, uint8_t &cls, uint8_t &id, uint16_t &len, uint32_t firstSyncTimeoutMs = 600)
 {
   if (!syncToUBX(s, firstSyncTimeoutMs))
@@ -300,8 +223,6 @@ static bool readUBXValid(HardwareSerial &s, uint8_t &cls, uint8_t &id, uint16_t 
     return false;
   return (ckA == inA) && (ckB == inB);
 }
-
-// Hex helpers for NMEA validation
 static uint8_t hex2nibble(char c)
 {
   if (c >= '0' && c <= '9')
@@ -313,7 +234,8 @@ static uint8_t hex2nibble(char c)
   return 0xFF;
 }
 
-// NMEA checksum over body (between '$' and '*')
+// --- NMEA helpers ---
+// Compute XOR of all chars between '$' and '*'
 static inline uint8_t nmeaChecksumBody(const String &body)
 {
   uint8_t cs = 0;
@@ -322,6 +244,7 @@ static inline uint8_t nmeaChecksumBody(const String &body)
   return cs;
 }
 
+// Parse two hex chars to a byte; return false if invalid
 static inline bool nmeaParseHexByte(char h1, char h2, uint8_t &out)
 {
   uint8_t hi = hex2nibble(h1), lo = hex2nibble(h2);
@@ -331,7 +254,6 @@ static inline bool nmeaParseHexByte(char h1, char h2, uint8_t &out)
   return true;
 }
 
-// Blocking-NMEA validator (used at setup for baud probing)
 static bool readNMEAValid(HardwareSerial &s, String &head, uint32_t timeoutMs = 1200)
 {
   uint32_t t0 = millis();
@@ -342,11 +264,16 @@ static bool readNMEAValid(HardwareSerial &s, String &head, uint32_t timeoutMs = 
       yield();
       continue;
     }
+
+    // Seek to '$'
     char c = s.read();
     if (c != '$')
-      continue; // seek '$'
-    String body;
+      continue;
+
+    String body; // everything between '$' and '*'
     uint32_t tBody = millis();
+
+    // Collect body until '*' (or line end)
     while (millis() - tBody < 900)
     {
       if (!s.available())
@@ -357,6 +284,7 @@ static bool readNMEAValid(HardwareSerial &s, String &head, uint32_t timeoutMs = 
       char d = s.read();
       if (d == '*')
       {
+        // Read two hex chars of checksum
         char h1 = 0, h2 = 0;
         uint32_t tw = millis();
         while (millis() - tw < 200 && !s.available())
@@ -370,15 +298,20 @@ static bool readNMEAValid(HardwareSerial &s, String &head, uint32_t timeoutMs = 
         if (!s.available())
           break;
         h2 = s.read();
+
         uint8_t want = 0;
         if (!nmeaParseHexByte(h1, h2, want))
           break;
+
+        // Eat to end-of-line
         while (s.available())
         {
           char e = s.read();
           if (e == '\n')
             break;
         }
+
+        // Validate checksum
         uint8_t got = nmeaChecksumBody(body);
         if (got == want)
         {
@@ -386,17 +319,16 @@ static bool readNMEAValid(HardwareSerial &s, String &head, uint32_t timeoutMs = 
           head = (comma > 0) ? body.substring(0, comma) : body;
           return true;
         }
-        break;
+        break; // checksum mismatch → try again
       }
       if (d == '\r' || d == '\n')
-        break; // malformed
-      body += d;
+        break;   // malformed (no '*')
+      body += d; // NOTE: '$' not included, per NMEA
     }
   }
   return false;
 }
 
-// Try a list of common baudrates and return the first that yields valid UBX/NMEA
 static int detectGPSBaudrateWithStatus()
 {
   const int n = sizeof(COMMON_BAUD_RATE) / sizeof(COMMON_BAUD_RATE[0]);
@@ -434,14 +366,10 @@ static int detectGPSBaudrateWithStatus()
   return -1;
 }
 
-/////////////////////
-// 9) UBX COMMAND BLOBS & SENDER
-/////////////////////
-
+// -------------------- UBX command blobs (precomputed) --------------------
 #include <pgmspace.h>
 #define PROGMEM_READ_U8(p, i) (uint8_t)pgm_read_byte(((const uint8_t *)(p)) + (i))
-
-// NMEA OFF (I2C/SPI/UART1)
+// NMEA msg
 static const uint8_t NMEA_ID_GGA_I2C_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBA, 0x00, 0x91, 0x20, 0x00, 0x05, 0xC6};
 static const uint8_t NMEA_ID_GGA_SPI_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBE, 0x00, 0x91, 0x20, 0x00, 0x09, 0xDA};
 static const uint8_t NMEA_ID_GGA_UART1_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xBB, 0x00, 0x91, 0x20, 0x00, 0x06, 0xCB};
@@ -460,20 +388,39 @@ static const uint8_t NMEA_ID_RMC_UART1_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 
 static const uint8_t NMEA_ID_VTG_I2C_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xB0, 0x00, 0x91, 0x20, 0x00, 0xFB, 0x94};
 static const uint8_t NMEA_ID_VTG_SPI_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xB4, 0x00, 0x91, 0x20, 0x00, 0xFF, 0xA8};
 static const uint8_t NMEA_ID_VTG_UART1_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0xB1, 0x00, 0x91, 0x20, 0x00, 0xFC, 0x99};
-
-// UBX NAV‑PVT enable on UART1
+// UBX mgs
 static const uint8_t UBX_NAV_PVT_UART1_ON[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, 0x00, 0x91, 0x20, 0x01, 0x53, 0x48};
-
-// Rate 10Hz, dyn model, GNSS masks (only used subset)
+// Rate
 static const uint8_t CFG_RATE_MEAS_10Hz[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x21, 0x30, 0x64, 0x00, 0x51, 0xB9};
+// Dyn model
 static const uint8_t CFG_NAVSPG_DYNMODEL_AUTOMOTIVE[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x21, 0x00, 0x11, 0x20, 0x04, 0xF0, 0x4D};
+// GNSS
+static const uint8_t GPS_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x1F, 0x00, 0x31, 0x10, 0x01, 0xFB, 0x80};
+static const uint8_t GPS_L1CA_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x31, 0x10, 0x01, 0xDD, 0xEA};
+
+static const uint8_t SBAS_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x00, 0x31, 0x10, 0x01, 0xFC, 0x85};
+static const uint8_t SBAS_L1CA_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x31, 0x10, 0x01, 0xE1, 0xFE};
+
+static const uint8_t BDS_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x22, 0x00, 0x31, 0x10, 0x01, 0xFE, 0x8F};
+static const uint8_t BDS_B1_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0D, 0x00, 0x31, 0x10, 0x01, 0xE9, 0x26};
+static const uint8_t BDS_B1_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0D, 0x00, 0x31, 0x10, 0x00, 0xE8, 0x25}; // BEIDOU B1I OFF
+static const uint8_t BDS_B1C_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0F, 0x00, 0x31, 0x10, 0x01, 0xEB, 0x30};    // BEIDOU B1C ON, same frequency as GPS L1 -> same antenna
+static const uint8_t BDS_B1C_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0F, 0x00, 0x31, 0x10, 0x00, 0xEA, 0x2F};
+
+static const uint8_t QZSS_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x24, 0x00, 0x31, 0x10, 0x01, 0x00, 0x99};
+static const uint8_t QZSS_L1CA_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00, 0x31, 0x10, 0x01, 0xEE, 0x3F};
+static const uint8_t QZSS_L1S_ENA[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x31, 0x10, 0x01, 0xF0, 0x49};
+
+static const uint8_t GLO_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x25, 0x00, 0x31, 0x10, 0x00, 0x00, 0x9D};
+
 static const uint8_t GAL_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x21, 0x00, 0x31, 0x10, 0x00, 0xFC, 0x89};
 static const uint8_t GAL_E1_ENA_OFF[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00, 0x00, 0x01, 0x00, 0x00, 0x07, 0x00, 0x31, 0x10, 0x00, 0xE2, 0x07};
 
-// UART baud change to 115200
+// UART RATE
 static const uint8_t CFG_UART1_BAUDRATE_115200[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0xC2, 0x01, 0x00, 0xF3, 0xA5};
+static const uint8_t CFG_UART1_BAUDRATE_230400[] PROGMEM = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x52, 0x40, 0x00, 0x84, 0x03, 0x00, 0xB7, 0xEF};
 
-// Send UBX blob from PROGMEM (small scratch buffer)
+// UBX send helpers
 static void sendUbx(const uint8_t *cmd)
 {
   const uint8_t len = PROGMEM_READ_U8(cmd, 4) | (PROGMEM_READ_U8(cmd, 5) << 8);
@@ -486,19 +433,16 @@ static void sendUbx(const uint8_t *cmd)
   GPS.write(buf, total);
   GPS.flush();
 }
-
-// Calculate UBX checksum over given data
 static void calcUbxChecksum(const uint8_t *data, uint16_t len, uint8_t &ckA, uint8_t &ckB)
 {
-  ckA = ckB = 0;
+  ckA = 0;
+  ckB = 0;
   for (uint16_t i = 0; i < len; i++)
   {
     ckA += data[i];
     ckB += ckA;
   }
 }
-
-// Send UBX and read 10‑byte ACK/NAK
 static bool sendUbxWithAck(const uint8_t *cmd, uint8_t expectCls, uint8_t expectId, uint16_t timeoutMs)
 {
   sendUbx(cmd);
@@ -583,10 +527,31 @@ static bool sendUbxWithAck(const uint8_t *cmd, uint8_t expectCls, uint8_t expect
   return false;
 }
 
-/////////////////////
-// 10) UBX FRAMER (stream → frames)
-/////////////////////
+// -------------------- UBX NAV-PVT struct --------------------
+#pragma pack(push, 1)
+struct UbxNavPvt
+{
+  uint32_t iTOW;
+  uint16_t year;
+  uint8_t month, day, hour, minute, second, valid;
+  uint32_t tAcc;
+  int32_t nano;
+  uint8_t fixType, flags, flags2, numSV;
+  int32_t lon, lat, height, hMSL;
+  uint32_t hAcc, vAcc;
+  int32_t velN, velE, velD, gSpeed; // mm/s
+  int32_t headMot;
+  uint32_t sAcc;
+  uint32_t headAcc;
+  uint16_t pDOP;
+  uint8_t reserved1[6];
+  int32_t headVeh;
+  int16_t magDec;
+  uint16_t magAcc;
+};
+#pragma pack(pop)
 
+// -------------------- UBX framer --------------------
 static const uint8_t UBX_SYNC1 = 0xB5;
 static const uint8_t UBX_SYNC2 = 0x62;
 static const uint16_t UBX_FRAMER_BUF = 2048;
@@ -612,7 +577,10 @@ public:
     }
     return false;
   }
-  bool feed(uint8_t c, UbxFrame &out) { return step(c, out); }
+  bool feed(uint8_t c, UbxFrame &out)
+  {
+    return step(c, out);
+  }
   void reset()
   {
     st_ = 0;
@@ -626,13 +594,11 @@ private:
   uint16_t payloadLen_ = 0, payIdx_ = 0;
   uint8_t ckA_ = 0, ckB_ = 0;
   uint8_t buf_[UBX_FRAMER_BUF];
-
   static inline void ckAdd(uint8_t b, uint8_t &A, uint8_t &B)
   {
     A += b;
     B += A;
   }
-
   bool step(uint8_t c, UbxFrame &out)
   {
     switch (st_)
@@ -642,7 +608,10 @@ private:
         st_ = 1;
       return false;
     case 1:
-      st_ = (c == UBX_SYNC2) ? 2 : 0;
+      if (c == UBX_SYNC2)
+        st_ = 2;
+      else
+        st_ = 0;
       return false;
     case 2:
       cls_ = c;
@@ -700,114 +669,85 @@ private:
 };
 static UbxFramer FR;
 
-/////////////////////
-// 11) FAST NMEA COUNTER (non‑alloc, per‑byte)
-/////////////////////
-
-enum : uint8_t
+// -------------------- NMEA prefilter (skip+count) --------------------
+static inline void nmeaPrefilterPoll(Stream &s, uint16_t *nmeaValidPerSec, int budgetBytes = 96)
 {
-  NMEA_IDLE = 0,
-  NMEA_BODY,
-  NMEA_STAR1,
-  NMEA_STAR2,
-  NMEA_AFTERCS,
-  NMEA_CR
-};
-
-static struct
-{
-  uint8_t st, xsum, h1, h2, haveValid; // state, running XOR, hex digits, valid flag
-  uint16_t cnt;                        // body length guard
-} s_nmea = {NMEA_IDLE, 0u, 0u, 0u, 0u, 0u};
-
-static inline void nmea_reset() { s_nmea = {NMEA_IDLE, 0, 0, 0, 0, 0}; }
-static inline void nmea_finalize_if_valid()
-{
-  if (s_nmea.haveValid)
-    nmeaPerSec++;
-  nmea_reset();
-}
-
-// Per‑byte feed (counts a sentence only when "*hh" matches)
-static inline void nmeaFeedByte(uint8_t c)
-{
-  if (c == '$')
+  enum State
   {
-    if (s_nmea.st != NMEA_IDLE)
-      nmea_finalize_if_valid();
-    s_nmea.st = NMEA_BODY;
-    s_nmea.xsum = 0;
-    s_nmea.cnt = 0;
-    s_nmea.haveValid = 0;
-    return;
-  }
-  switch (s_nmea.st)
+    IDLE,
+    BODY,
+    STAR1,
+    STAR2,
+    EAT_EOL
+  };
+  static State st = IDLE;
+  static uint8_t xsum = 0;
+  static char h1 = 0, h2 = 0;
+
+  int processed = 0;
+  while (processed < budgetBytes && s.available())
   {
-  case NMEA_IDLE:
-    break;
-  case NMEA_BODY:
-    if (c == '*')
-      s_nmea.st = NMEA_STAR1;
-    else if (c == '\r')
-      s_nmea.st = NMEA_CR;
-    else if (c == '\n')
-      nmea_reset();
-    else
+    char c = s.read();
+    processed++;
+    switch (st)
     {
-      s_nmea.xsum ^= c;
-      if (++s_nmea.cnt > 110)
-        nmea_reset();
-    }
-    break;
-  case NMEA_STAR1:
-  {
-    uint8_t hi = hex2nibble((char)c);
-    if (hi == 0xFF)
+    case IDLE:
+      if (c == '$')
+      {
+        xsum = 0;
+        st = BODY;
+      }
+      break;
+
+    case BODY:
+      if (c == '*')
+      {
+        st = STAR1;
+      }
+      else if (c == '\r' || c == '\n')
+      {
+        st = IDLE;
+      } // invalid line; drop
+      else
+      {
+        xsum ^= (uint8_t)c;
+      }
+      break;
+
+    case STAR1:
+      h1 = c;
+      st = STAR2;
+      break;
+
+    case STAR2:
     {
-      nmea_reset();
+      h2 = c;
+      uint8_t hi = hex2nibble(h1), lo = hex2nibble(h2);
+      if (hi != 0xFF && lo != 0xFF)
+      {
+        uint8_t want = (uint8_t)((hi << 4) | lo);
+        if (nmeaValidPerSec && want == xsum)
+          (*nmeaValidPerSec)++; // count only checksum‑valid sentences
+      }
+      st = EAT_EOL; // consume until LF
       break;
     }
-    s_nmea.h1 = c;
-    s_nmea.st = NMEA_STAR2;
-  }
-  break;
-  case NMEA_STAR2:
-  {
-    uint8_t lo = hex2nibble((char)c);
-    if (lo == 0xFF)
-    {
-      nmea_reset();
+
+    case EAT_EOL:
+      if (c == '\n')
+        st = IDLE;
       break;
     }
-    uint8_t hi = hex2nibble((char)s_nmea.h1);
-    uint8_t want = (uint8_t)((hi << 4) | lo);
-    s_nmea.haveValid = (want == s_nmea.xsum) ? 1u : 0u;
-    s_nmea.st = NMEA_AFTERCS;
-  }
-  break;
-  case NMEA_AFTERCS:
-    if (c == '\r')
-      s_nmea.st = NMEA_CR;
-    else if (c == '\n')
-      nmea_finalize_if_valid();
-    break;
-  case NMEA_CR:
-    if (c == '\n')
-      nmea_finalize_if_valid();
-    break;
   }
 }
 
-/////////////////////
-// 12) SNAPSHOTS (REALTIME + COUNTER)
-/////////////////////
-
+// -------------------- Dual snapshots --------------------
 struct RtSnapshot
 {
   volatile uint32_t seq;
   UbxNavPvt pvt;
   bool gpsLost;
-  uint32_t pvtVer; // increments on each valid NAV‑PVT
+  uint32_t pvtVer; // NEW: tăng mỗi lần xử lý 1 bản tin NAV-PVT hợp lệ
 };
 struct CntSnapshot
 {
@@ -819,15 +759,15 @@ static RtSnapshot g_rtSnap;
 static CntSnapshot g_cntSnap;
 static portMUX_TYPE g_rtMux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_cntMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t g_pvtVer = 0; // NEW: version/counter cho NAV-PVT
 
-// Lock-free style double‑read (seq even => stable)
 static inline void rt_write(const UbxNavPvt &p, bool lost, uint32_t ver)
 {
   portENTER_CRITICAL(&g_rtMux);
   g_rtSnap.seq++;
   g_rtSnap.pvt = p;
   g_rtSnap.gpsLost = lost;
-  g_rtSnap.pvtVer = ver;
+  g_rtSnap.pvtVer = ver; // NEW
   g_rtSnap.seq++;
   portEXIT_CRITICAL(&g_rtMux);
 }
@@ -867,36 +807,47 @@ static inline void cnt_read(CntSnapshot &out)
   } while (s1 != s2 || (s2 & 1));
 }
 
-/////////////////////
-// 13) RENDERING (OLED)
-/////////////////////
+// -------------------- Globals --------------------
+static volatile bool g_running = true;
+static UbxNavPvt g_lastPvt{};
+static uint32_t lastNavPvtTick = 0;
+static bool gpsLost = true;
+
+// Counters for 1 Hz
+static uint16_t ubxSeenPerSec = 0, ubxSeenLastSec = 0;
+static uint16_t pvtSeenPerSec = 0, pvtSeenLastSec = 0;
+static uint16_t pvtValidPerSec = 0, pvtValidLastSec = 0;
+static uint16_t nmeaPerSec = 0, nmeaLastSec = 0;
+
+// -------------------- Utility & UI state --------------------
+// static inline float mmps_to_kmh(int32_t mmps) { return mmps * 0.0036f; }
+static int speedCalibrationOffset = 0; // 0..5 km/h
+static const char spinner[] = "/-\\|";
 
 struct RenderState
 {
   bool gpsLost;
   uint8_t fixType, numSV, calOffset;
   bool sAccBad;
-  float print_speed; // speed in kmh
-  uint8_t gpsSpin;   // spinner advanced when new PVT arrives
-  uint8_t scrSpin;   // spinner advanced on each redraw
+  uint16_t speed_i10;
+  uint8_t gpsSpin; // NEW
+  uint8_t scrSpin; // NEW
 };
 static RenderState lastRS{true, 0xFF, 0, 0xFF, false, 0xFFFF, 0, 0};
 
-// Large, single pass draw (no allocations)
 static void drawScreen(const RenderState &rs)
 {
+  // Setup
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
-  // Screen spinner
+  // Screen Spinner
   display.setTextSize(2);
   display.setCursor(0, 0);
   display.print(spinner[rs.scrSpin]);
-  // GPS spinner
+  // GPS Spinner
   display.setCursor(15, 0);
   display.print(spinner[rs.gpsSpin]);
-
-  // Calibration offset
+  // Offset
   display.setTextSize(1);
   display.setCursor(88, 2);
   display.print("+");
@@ -905,8 +856,9 @@ static void drawScreen(const RenderState &rs)
   display.setCursor(104, 2);
   display.print("kmh");
 
-  // Satellite icon + number of sats (or 'x' when lost)
+  // Sat logo
   display.drawXBitmap(30, 0, sat_logo, sat_logo_WIDTH, sat_logo_HEIGHT, 1);
+  // Number of satlites
   display.setTextSize(2);
   display.setCursor(55, 0);
   if (rs.gpsLost)
@@ -914,7 +866,7 @@ static void drawScreen(const RenderState &rs)
   else
     display.print(rs.numSV);
 
-  // Accuracy warning (bottom-right 'x')
+  // Inaccuracy indicator
   if (rs.sAccBad)
   {
     display.setTextSize(1);
@@ -922,7 +874,7 @@ static void drawScreen(const RenderState &rs)
     display.print("x");
   }
 
-  // Speed (LOST / --- / value)
+  // Speed
   display.setTextSize(4);
   display.setCursor(0, 28);
   if (rs.gpsLost)
@@ -931,96 +883,73 @@ static void drawScreen(const RenderState &rs)
     display.print("---");
   else
   {
-    if (rs.print_speed >= 100.0f)
+    if (rs.speed_i10 >= 1000)
     {
       display.setCursor(0, 28);
-      display.print((int)lroundf(rs.print_speed));
+      display.print((int)(rs.speed_i10 / 10));
     }
-    else if (rs.print_speed >= 10.0f)
+    else if (rs.speed_i10 >= 100)
     {
       display.setCursor(30, 28);
-      display.print((int)lroundf(rs.print_speed));
+      display.print((int)(rs.speed_i10 / 10));
     }
     else
     {
       display.setCursor(0, 28);
-      display.print(rs.print_speed, 1);
+      display.print(rs.speed_i10 / 10.0f, 1);
     }
   }
   display.display();
 }
 
-/////////////////////
-// 14) GPS BYTE PIPELINE (core1)
-/////////////////////
-
-// Process a batch: feed both NMEA counter and UBX framer
-static inline IRAM_ATTR void processGpsBytesBatch(const uint8_t *buf, size_t n)
-{
-  UbxFrame f;
-  for (size_t i = 0; i < n; ++i)
-  {
-    const uint8_t c = buf[i];
-
-    // NMEA fast-path (stateful)
-    if (c == '$' || s_nmea.st != NMEA_IDLE)
-      nmeaFeedByte(c);
-
-    // UBX framer (cheap unless sync seen)
-    if (FR.feed(c, f))
-    {
-      ubxSeenPerSec++;
-      if (f.cls == 0x01 && f.id == 0x07 && f.len == sizeof(UbxNavPvt))
-      {
-        pvtSeenPerSec++;
-        memcpy((void *)&g_lastPvt, f.payload, sizeof(UbxNavPvt));
-        lastNavPvtTick = millis();
-        gpsLost = false;
-        g_pvtVer++;
-        rt_write(g_lastPvt, gpsLost, g_pvtVer);
-        if (g_lastPvt.fixType >= 2)
-          pvtValidPerSec++;
-      }
-    }
-  }
-}
-
-// Task on core1: read UART in batches, update counters & lost state
+// -------------------- GPS task (core 1) --------------------
 static void gps_task(void *)
 {
   coreIdGps = xPortGetCoreID();
   Serial.printf("[gps_task] running on core %d\n", coreIdGps);
-
-  static uint8_t batch[512];
   uint32_t tRate = millis();
-
   while (g_running)
   {
-    int avail = GPS.available();
-    if (avail > 0)
+    // UBX framer
+    UbxFrame f;
+    while (GPS.available())
     {
-      int toRead = (avail > (int)sizeof(batch)) ? (int)sizeof(batch) : avail;
-      int n = GPS.readBytes((char *)batch, toRead);
-      if (n > 0)
-        processGpsBytesBatch(batch, (size_t)n);
-    }
-    else
-    {
-      vTaskDelay(pdMS_TO_TICKS(1)); // light yield
+      // if (GPS.peek() == '$')
+      // {
+      //   // có thể có >1 câu NMEA dính nhau → cho hàm tự quét đến cuối dòng & tăng nmeaPerSec
+      //   nmeaPrefilterPoll(GPS, &nmeaPerSec, 128);
+      //   continue;
+      // }
+      uint8_t c = (uint8_t)GPS.read();
+      if (FR.feed(c, f))
+      {
+        ubxSeenPerSec++;
+        if (f.cls == 0x01 && f.id == 0x07 && f.len == sizeof(UbxNavPvt))
+        {
+          pvtSeenPerSec++;
+          memcpy((void *)&g_lastPvt, f.payload, sizeof(UbxNavPvt));
+          lastNavPvtTick = millis();
+          gpsLost = false;
+          g_pvtVer++;
+          rt_write(g_lastPvt, gpsLost, g_pvtVer);
+          if (g_lastPvt.fixType >= 2)
+            pvtValidPerSec++;
+        }
+      }
     }
 
-    // LOST detection (no PVT for >2.2s)
+    // LOST detect
     uint32_t now = millis();
-    if (now - lastNavPvtTick > GPS_LOST_TIMEOUT_MS)
+    if (now - lastNavPvtTick > 5000)
     {
       if (!gpsLost)
       {
         gpsLost = true;
-        rt_write(g_lastPvt, gpsLost, g_pvtVer);
+        rt_write(g_lastPvt, gpsLost, g_pvtVer); // giữ nguyên version
       }
     }
 
-    // Publish counters every 1s
+    // 1 Hz counters publish
     if (now - tRate >= 1000)
     {
       tRate = now;
@@ -1034,25 +963,24 @@ static void gps_task(void *)
       nmeaPerSec = 0;
       cnt_write(ubxSeenLastSec, pvtSeenLastSec, pvtValidLastSec, nmeaLastSec);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
   vTaskDelete(nullptr);
 }
 
-/////////////////////
-// 15) UI HELPERS & TASK (core0)
-/////////////////////
-
-// Piecewise calibration based on actual speed
-static inline int getEffectiveCalibrationOffset(int32_t g_mmps, int rawOffset)
+// -------------------- UI task (core 0) --------------------
+static inline int getEffectiveCalibrationOffset(float speedKmh, int rawOffset)
 {
   int eff = rawOffset;
-  if (g_mmps < 5556)
-    eff = rawOffset - 3; // <20 km/h
-  else if (g_mmps < 11112)
-    eff = rawOffset - 2; // 20..40
-  else if (g_mmps < 16668)
-    eff = rawOffset - 1; // 40..60
-  // else = rawOffset
+  if (speedKmh >= 60)
+    eff = rawOffset;
+  else if (speedKmh >= 40)
+    eff = rawOffset - 1;
+  else if (speedKmh >= 20)
+    eff = rawOffset - 2;
+  else
+    eff = rawOffset - 3;
   if (eff < 0)
     eff = 0;
   if (eff > 5)
@@ -1060,15 +988,14 @@ static inline int getEffectiveCalibrationOffset(int32_t g_mmps, int rawOffset)
   return eff;
 }
 
-// UI task: reads snapshots, decides redraws, prints debug
 static void ui_task(void *)
 {
   coreIdUi = xPortGetCoreID();
   Serial.printf("[ui_task]  running on core %d\n", coreIdUi);
   Serial.println("====================================================");
-
-  uint32_t lastDrawMs = 0, lastStatMs = 0, lastRedrawUs = 0, lastPvtVer = 0;
-  uint32_t redrawCount = 0, redrawsPerSec = 0;
+  uint32_t lastDrawMs = 0,
+           lastStatMs = 0, lastRedrawUs = 0, lastPvtVer = 0;
+  uint32_t redrawCount = 0, redrawsPerSec = 0; // PATCH: new
 
   uint8_t gpsSpin = 0;
   RtSnapshot rt{};
@@ -1076,7 +1003,7 @@ static void ui_task(void *)
 
   for (;;)
   {
-    // Button: short press to cycle calibration offset (0..5)
+    // Button
     if (digitalRead(PIN_BUTTON) == HIGH)
     {
       vTaskDelay(pdMS_TO_TICKS(200));
@@ -1087,33 +1014,40 @@ static void ui_task(void *)
     // Read realtime snapshot frequently
     rt_read(rt);
 
-    // Build render state from snapshot
+    // Build render state
     RenderState rs;
     rs.gpsLost = rt.gpsLost;
     rs.fixType = rt.pvt.fixType;
     rs.numSV = rt.pvt.numSV;
     rs.calOffset = (uint8_t)speedCalibrationOffset;
-
-    // sAcc bad when: <20km/h → >1km/h sAcc; ≥20km/h → sAcc > 5% gSpeed
-    rs.sAccBad = ((rt.pvt.gSpeed <= 5555) && (rt.pvt.sAcc > 278)) ||
-                 ((rt.pvt.gSpeed > 5555) && ((float)rt.pvt.sAcc > 0.05f * (float)rt.pvt.gSpeed));
-
-    // GPS spinner advances when a new PVT arrives
+    // rs.sAccBad = ((float)rt.pvt.sAcc > 0.05f * (float)rt.pvt.gSpeed);
+    rs.sAccBad = ((rt.pvt.gSpeed <= (int32_t)5555) && (rt.pvt.sAcc > (int32_t)278)) || ((rt.pvt.gSpeed > (int32_t)5555) && ((float)rt.pvt.sAcc > 0.05f * (float)rt.pvt.gSpeed)); // < 20kmh --> sAcc 1kmh, > 20kmh --> sAcc > 5% gSpeed
+    // if ((rt.pvt.gSpeed <= (int32_t)5555) && (rt.pvt.sAcc > (int32_t)278))
+    //   rs.sAccBad == true;
+    // else if ((rt.pvt.gSpeed > 5555) && ((float)rt.pvt.sAcc > 0.05f * (float)rt.pvt.gSpeed))
+    //   rs.sAccBad == true;
+    // else
+    //   rs.sAccBad == false;
+    // < 20kmh --> sAcc 1kmh, > 20kmh --> sAcc > 5% gSpeed
     rs.gpsSpin = lastRS.gpsSpin;
     if (rt.pvtVer != lastPvtVer)
+    {
       rs.gpsSpin = (uint8_t)((rs.gpsSpin + 1) % 4);
+    }
 
-    // Speed formatting (+ calibration)
     float speedKmh = rt.gpsLost ? 0.0f : (rt.pvt.gSpeed * 0.0036f);
     if (speedKmh < 1.0f)
       speedKmh = 0.0f;
-    int effOffset = getEffectiveCalibrationOffset(rt.pvt.gSpeed, speedCalibrationOffset);
+    int effOffset = getEffectiveCalibrationOffset(speedKmh, speedCalibrationOffset);
     float print_speed = rs.gpsLost ? 0.0f : (speedKmh + effOffset);
-    rs.print_speed = print_speed;
+    rs.speed_i10 = (uint16_t)lroundf(print_speed * 10.0f);
 
-    // Redraw policy: on new PVT / lost change / offset change, or ≥200ms
     uint32_t now = millis();
-    bool changed = (rt.pvtVer != lastPvtVer) || (rs.gpsLost != lastRS.gpsLost) || (rs.calOffset != lastRS.calOffset);
+    // Sau rt_read(rt) và build RenderState rs
+    bool changed = (rt.pvtVer != lastPvtVer) ||        // NEW: có PVT mới
+                   (rs.gpsLost != lastRS.gpsLost) ||   // trạng thái mất GPS đổi
+                   (rs.calOffset != lastRS.calOffset); // bấm nút đổi offset
+
     bool needDraw = changed || (now - lastDrawMs > 200);
     if (needDraw)
     {
@@ -1124,17 +1058,16 @@ static void ui_task(void *)
       lastDrawMs = now;
       lastRS = rs;
       lastPvtVer = rt.pvtVer;
-      redrawCount++;
+      redrawCount++; // PATCH: count redraw
     }
 
-    // 1 Hz debug print
+    // 1 Hz: read and print counters
     if (now - lastStatMs >= 1000)
     {
       lastStatMs = now;
       cnt_read(cnt);
-      redrawsPerSec = redrawCount;
-      redrawCount = 0;
-
+      redrawsPerSec = redrawCount; // PATCH
+      redrawCount = 0;             // reset
 #if DEBUG_PROFILE
 #if DEBUG_CPU
       float load[2] = {0, 0};
@@ -1154,7 +1087,7 @@ static void ui_task(void *)
       Serial.printf("PVT_valid/s      : %u (pps)\n", cnt.pvtValidPerSec);
       Serial.printf("NMEA/s           : %u (pps)\n", cnt.nmeaPerSec);
       Serial.printf("redraw_ms        : %u (ms)\n", (unsigned long)lastRedrawUs);
-      Serial.printf("redraw/s (FPS)   : %u (fps)\n", redrawsPerSec);
+      Serial.printf("redraw/s (FPS)   : %u (fps)\n", redrawsPerSec); // PATCH: new log
       Serial.println("----------------------------------------------");
 #endif
     }
@@ -1163,17 +1096,13 @@ static void ui_task(void *)
   }
 }
 
-/////////////////////
-// 16) SETUP & LOOP
-/////////////////////
-
+// -------------------- setup/loop --------------------
 void setup()
 {
-  // Max CPU frequency (also set in platformio.ini)
-  setCpuFrequencyMhz(240);
+  setCpuFrequencyMhz(240); // runtime force 240 MHz
   Serial.begin(115200);
 
-  // Disable radios & free memory early
+  // Turn off radios & free memory
   WiFi.mode(WIFI_OFF);
   esp_wifi_stop();
   esp_wifi_deinit();
@@ -1182,12 +1111,10 @@ void setup()
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
 
-  // I2C (SSD1306)
   Wire.begin(21, 22);
   Wire.setClock(400000);
   Serial.printf("[ESP32] CPU frequency = %u MHz\n", getCpuFrequencyMhz());
 
-  // OLED splash
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
   {
     Serial.println(F("[SETUP] SSD1306 allocation failed"));
@@ -1203,7 +1130,7 @@ void setup()
 
   pinMode(PIN_BUTTON, INPUT_PULLDOWN);
 
-  // Auto-baud detect (accepts UBX or NMEA)
+  // DETECT CURRENT BAUDRATE
   Serial.println("\n[SETUP] [Auto-Baud Detect | UBX checksum or NMEA]");
   static int CURRENT_BAUD_RATE = detectGPSBaudrateWithStatus();
   if (CURRENT_BAUD_RATE > 0)
@@ -1211,7 +1138,6 @@ void setup()
   else
     Serial.println("[SETUP] !!! Cannot detect GPS baudrate (no valid UBX/NMEA on known rates).");
 
-  // If not at target baud → push configuration at detected baud, then verify
   if (CURRENT_BAUD_RATE != (int)TARGET_BAUD)
   {
     display.clearDisplay();
@@ -1220,7 +1146,6 @@ void setup()
     display.setCursor(0, 14);
     display.print("[SETUP] Send CMD");
     display.display();
-
     Serial.println("[SETUP] Looks like GPS module is at factory setting. Reconfiguring...");
     GPS.begin(CURRENT_BAUD_RATE, SERIAL_8N1, PIN_RXD2, PIN_TXD2);
 
@@ -1235,6 +1160,7 @@ void setup()
       display.print(ok ? "OK" : "NOK");
       display.display();
     };
+
     auto sendWithAckLog = [&](const uint8_t *cmd, uint8_t cls, uint8_t id, const char *name, uint16_t timeout)
     {
       bool ok = sendUbxWithAck(cmd, cls, id, timeout);
@@ -1244,7 +1170,7 @@ void setup()
       return ok;
     };
 
-    // Disable NMEA on all ports, enable NAV‑PVT, set 10 Hz, automotive, set UART 115200
+    // Disable NMEA on all ports; enable UBX NAV-PVT; set 10 Hz; tweak signals; set baud 115200
     sendWithAckLog(NMEA_ID_GGA_I2C_OFF, 0x06, 0x8a, "NMEA GGA I2C OFF", 1000);
     sendWithAckLog(NMEA_ID_GGA_SPI_OFF, 0x06, 0x8a, "NMEA GGA SPI OFF", 1000);
     sendWithAckLog(NMEA_ID_GGA_UART1_OFF, 0x06, 0x8a, "NMEA GGA UART1 OFF", 1000);
@@ -1271,17 +1197,21 @@ void setup()
     delay(1000);
     sendWithAckLog(GAL_E1_ENA_OFF, 0x06, 0x8a, "GAL E1 OFF", 1000);
     delay(1000);
+    // sendWithAckLog(BDS_B1_ENA_OFF, 0x06, 0x8a, "BDS B1I OFF", 1000);
+    // delay(1000);
+    // sendWithAckLog(BDS_B1C_ENA, 0x06, 0x8a, "BDS B1C ON", 1000);
+    // delay(1000);
     sendWithAckLog(CFG_UART1_BAUDRATE_115200, 0x06, 0x8a, "UART1 115200", 1000);
 
     GPS.flush();
     GPS.end();
     delay(80);
-
-    // Verify baud switched successfully
+    // PATCH: verify module switched to TARGET_BAUD
     int rebaud = detectGPSBaudrateWithStatus();
     if (rebaud != (int)TARGET_BAUD)
     {
-      Serial.printf("[SETUP] !!! GPS baud mismatch: detected %d, expected %u. Halting.\n", rebaud, TARGET_BAUD);
+      Serial.printf("[SETUP] !!! GPS baud mismatch: detected %d, expected %u. Halting.\n",
+                    rebaud, TARGET_BAUD);
       display.clearDisplay();
       display.setTextColor(SSD1306_WHITE);
       display.setTextSize(2);
@@ -1293,15 +1223,15 @@ void setup()
       while (1)
       {
         delay(1000);
-      }
+      } // halt forever
     }
   }
 
-  // Final UART configuration
   GPS.end();
   delay(50);
-  Serial.println(F("[SETUP] Set GPS rx buffer size to 4096 bytes"));
-  GPS.setRxBufferSize(4096);
+  Serial.println(F("[SETUP] Set GPS rx buffer size to 2048 bytes"));
+
+  GPS.setRxBufferSize(2048);
   GPS.begin(TARGET_BAUD, SERIAL_8N1, PIN_RXD2, PIN_TXD2);
 
   Serial.println(F("[SETUP] Setup complete. Speedometer should start now!"));
@@ -1313,16 +1243,12 @@ void setup()
   display.print("READY");
   display.display();
   delay(300);
-
 #if DEBUG_CPU
-  // Register idle hooks for load measurement
   esp_register_freertos_idle_hook_for_cpu(idle_hook_core0, 0);
   esp_register_freertos_idle_hook_for_cpu(idle_hook_core1, 1);
 #endif
 
-  // Start tasks (core1: GPS, core0: UI)
-  xTaskCreatePinnedToCore(gps_task, "gps", 6144, nullptr, 9, nullptr, 1);
-  xTaskCreatePinnedToCore(ui_task, "ui", 6144, nullptr, 4, nullptr, 0);
+  xTaskCreatePinnedToCore(gps_task, "gps", 6144, nullptr, 9, nullptr, 1); // Core 1
+  xTaskCreatePinnedToCore(ui_task, "ui", 6144, nullptr, 4, nullptr, 0);   // Core 0
 }
-
 void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }

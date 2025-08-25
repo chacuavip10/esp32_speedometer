@@ -27,7 +27,6 @@ import random
 import struct
 from datetime import datetime, timezone
 from typing import Optional, Dict, Tuple, List
-
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -161,6 +160,9 @@ class UbxNmeaSimulator:
         self.stats_cb = stats_cb or (lambda s: None)
         self.tx_cb = tx_cb or (lambda n, u: None)
         self.stop_event = stop_event or threading.Event()
+        self.paused = False
+        self._total_counts = {k: 0 for k in ["pvt","velned","sol","gga","gll","gsa","gsv","rmc","vtg"]}
+
 
         # Serial open (offline if pyserial missing or open fails)
         self.ser = None
@@ -187,7 +189,7 @@ class UbxNmeaSimulator:
     # ---- config & profile state ----
     def _apply_config(self, cfg: dict, reset_all: bool):
         self.cfg = dict(cfg)  # shallow copy
-        self.update_rate_hz = max(0.01, float(cfg["update_rate_hz"]))
+        self.update_rate_hz = max(0.01, cfg["update_rate_hz"])
         self.send_interval = 1.0 / self.update_rate_hz
 
         self.ubx_en = dict(cfg["ubx_enable"])
@@ -214,7 +216,7 @@ class UbxNmeaSimulator:
             self.lat, self.lon, self.h_m = 51.5074, -0.1278, 15.0
             self.speed_kmh, self.heading_deg, self.itow_ms = 0.0, 0.0, 0
             self.fix_type, self.sats = 3, 12
-            self.hacc_mm, self.sacc_mms = 2000, 300
+            self.hacc_mm, self.sacc_mms = 2000, 100
 
         # Actual-rate tracking per message
         keys = ["pvt", "velned", "sol", "gga", "gll", "gsa", "gsv", "rmc", "vtg"]
@@ -460,19 +462,27 @@ class UbxNmeaSimulator:
                 try:
                     while True:
                         cmd = self.ctrl_q.get_nowait()
-                        if isinstance(cmd, dict) and cmd.get("cmd") == "reset":
-                            new_cfg = cmd.get("cfg", {})
-                            if serial is not None and (
-                                new_cfg.get("port") != self.cfg.get("port") or
-                                new_cfg.get("baudrate") != self.cfg.get("baudrate")
-                            ):
-                                self._open_serial(new_cfg["port"], new_cfg["baudrate"])
-                            self._apply_config(new_cfg, reset_all=True)
-                            now = time.perf_counter()
-                            next_send, next_rate = now + self.send_interval, now + 1.0
+                        if isinstance(cmd, dict):
+                            if cmd.get("cmd") == "reset":
+                                new_cfg = cmd.get("cfg", {})
+                                if serial is not None and (
+                                    new_cfg.get("port") != self.cfg.get("port") or
+                                    new_cfg.get("baudrate") != self.cfg.get("baudrate")
+                                ):
+                                    self._open_serial(new_cfg["port"], new_cfg["baudrate"])
+                                self._apply_config(new_cfg, reset_all=True)
+                                now = time.perf_counter()
+                                next_send, next_rate = now + self.send_interval, now + 1.0
+
+                            # NEW: pause/resume command
+                            elif cmd.get("cmd") == "pause":
+                                self.paused = bool(cmd.get("value", False))
                 except queue.Empty:
                     pass
 
+                if self.paused:
+                    time.sleep(0.05)
+                    continue
                 now = time.perf_counter()
                 self._advance_profile_if_needed(now)
                 self._emit_profile(now)
@@ -492,11 +502,11 @@ class UbxNmeaSimulator:
                     if random.random() < 0.05:
                         self.fix_type = 2; self.sats = random.randint(4, 8)
                         self.hacc_mm = random.randint(5000, 15000)
-                        self.sacc_mms = random.randint(500, 2000)
-                    else:
+                        self.sacc_mms = random.randint(300, 5000)
+                    else: # 95% of time
                         self.fix_type = 3; self.sats = random.randint(8, 16)
                         self.hacc_mm = random.randint(1000, 5000)
-                        self.sacc_mms = random.randint(200, 800)
+                        self.sacc_mms = random.randint(100, 600)
                     if random.random() < 0.002:
                         self.fix_type = 0; self.sats = random.randint(0, 4)
 
@@ -528,6 +538,7 @@ class UbxNmeaSimulator:
                             if self.ser: self.ser.write(pkt)
                         except Exception: pass
                         self._sent_counts["pvt"] += 1
+                        self._total_counts["pvt"] += 1
                         ubx_map["pvt"] = pkt.hex().upper()
                     if self.ubx_en.get("velned"):
                         pkt = self.build_nav_velned()
@@ -535,6 +546,7 @@ class UbxNmeaSimulator:
                             if self.ser: self.ser.write(pkt)
                         except Exception: pass
                         self._sent_counts["velned"] += 1
+                        self._total_counts["velned"] += 1
                         ubx_map["velned"] = pkt.hex().upper()
                     if self.ubx_en.get("sol"):
                         pkt = self.build_nav_sol()
@@ -542,6 +554,7 @@ class UbxNmeaSimulator:
                             if self.ser: self.ser.write(pkt)
                         except Exception: pass
                         self._sent_counts["sol"] += 1
+                        self._total_counts["sol"] += 1
                         ubx_map["sol"] = pkt.hex().upper()
 
                     # NMEA
@@ -559,10 +572,11 @@ class UbxNmeaSimulator:
                                 if self.ser: self.ser.write(s.encode("ascii"))
                             except Exception: pass
                             self._sent_counts[key] += 1
+                            self._total_counts[key] += 1
                             nmea_map[key] = s.strip()
 
                     if nmea_map or ubx_map:
-                        self.tx_cb(nmea_map, ubx_map)
+                        self.tx_cb(nmea_map, ubx_map, dict(self._total_counts))
 
                     # Catch up in case of lag
                     skips = max(1, int((now - next_send) // self.send_interval) + 1)
@@ -594,9 +608,9 @@ class UbxNmeaSimulator:
 class SimulatorGUI:
     UND = "______"  # placeholder for NO_FIX / GPS_DISABLE
     DEFAULT_DUR = {
-        "STATIONARY": 5, "WALKING": 5, "CITY_DRIVING": 5,
+        "STATIONARY": 0, "WALKING": 0, "CITY_DRIVING": 5,
         "HIGHWAY_DRIVING": 5, "HIGH_SPEED": 5,
-        "NO_FIX": 5, "GPS_DISABLE": 10,
+        "NO_FIX": 0, "GPS_DISABLE": 0,
     }
 
     def __init__(self, root: tk.Tk):
@@ -610,6 +624,8 @@ class SimulatorGUI:
         self.mono_font = ("Consolas", 10)
         self.big_speed_font = ("Segoe UI", 16, "bold")
         self.active_prof_font = ("Segoe UI", 14, "bold")
+        self.last3_font = ("Segoe UI", 14, "bold")  # NEW: slightly larger font for "last3"
+
 
         # Colors
         self.col_green = "#2e7d32"
@@ -624,10 +640,19 @@ class SimulatorGUI:
         self.tx_queue = queue.Queue()
         self.ctrl_queue = queue.Queue()
 
+        # UI label for packet totals (added in Current status)
+        # Row/column chosen to avoid overlap with existing labels.
+        self.lbl_pkt_totals = None
+        # A blank template used on Stop/clear:
+        self._totals_blank_text = "Packets total: —"
+
         # Worker control
         self.sim_thread = None
         self.stop_event = threading.Event()
         self.sim_running = False
+        # Pause/Resume state
+        self.paused = False
+        self._pause_label_cache = ("Pause", "Resume")
 
         # Dirty tracking (for "Apply to running")
         self._last_applied_config = None
@@ -833,13 +858,45 @@ class SimulatorGUI:
         self.active_prof_value.grid(row=base_row, column=1, sticky="w", pady=(6, 0))
         self.active_prog.grid(row=base_row, column=2, columnspan=3, sticky="ew", pady=(6, 0))
 
+        # ==== Calibration (speed offset) ====    <-- ADD THIS BLOCK
+        cal = ttk.LabelFrame(root, text="Speed calibration", padding=8)
+        cal.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        for c, w in enumerate([220, 180, 220, 180, 220, 180]):
+            cal.grid_columnconfigure(c, minsize=w)
+
+        ttk.Label(cal, text="speedCalibrationOffset (km/h):").grid(row=0, column=0, sticky="w")
+        self.calib_var = tk.StringVar(value="0")  # raw offset 0..5
+        def _on_calib_changed(*_):
+            # mark dirty? not needed for worker; just refresh effective display
+            # <-- ADD: mark dirty so Apply to running is enabled
+            self._mark_dirty(True)  # enable Apply when sim is running
+            try:
+                # force refresh of effective label using last-known speed
+                kmh = getattr(self, "_last_speed_kmh", None)
+                raw = self._parse_int_str(self.calib_var.get())
+                eff = self._effective_offset_from_kmh(kmh, raw) if kmh is not None else raw
+                self.lbl_eff_offset.config(text=f"Effective offset: {eff} kmh")
+            except Exception:
+                pass
+        self.calib_spin = tk.Spinbox(
+            cal, from_=0, to=5, increment=1, width=6,
+            textvariable=self.calib_var, command=_on_calib_changed, justify="left"
+)
+        self.calib_spin.grid(row=0, column=1, sticky="w")
+        self.calib_spin.bind("<KeyRelease>", _on_calib_changed)
+
+        # Effective offset (auto-updated per packet)
+        self.lbl_eff_offset = ttk.Label(cal, text="Effective offset: 0 kmh", font=self.mono_font)
+        self.lbl_eff_offset.grid(row=0, column=2, sticky="w")
+
         # ==== Current status ====
         stat = ttk.LabelFrame(root, text="Current status", padding=8)
-        stat.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        stat.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))  # was row=3
         for i in range(6): stat.grid_columnconfigure(i, minsize=190)
 
         self.lbl_speed_big = ttk.Label(stat, text="Speed: —", font=self.big_speed_font)
-        self.lbl_speed_big.grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
+        self.lbl_speed_big.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))  # was 6 -> now 3
+
 
         def mono_label(parent, txt, col, row):
             lbl = ttk.Label(parent, text=txt, font=self.mono_font, anchor="w")
@@ -855,20 +912,29 @@ class SimulatorGUI:
         self.lbl_lat      = mono_label(stat, "Lat: —", 0, 2)
         self.lbl_lon      = mono_label(stat, "Lon: —", 1, 2)
 
+        # NEW: Packets total line (separate row)
+        self.lbl_pkt_totals = ttk.Label(
+            stat, text=self._totals_blank_text, font=self.mono_font, anchor="w"
+        )
+        # đặt riêng 1 dòng cuối cùng (ví dụ row=10 cho chắc, chiếm hết 6 cột)
+        self.lbl_pkt_totals.grid(row=10, column=0, columnspan=6, sticky="w", pady=(4,0))
+
         # ==== Buttons ====
         btns = ttk.Frame(root, padding=(8, 0, 8, 8))
-        btns.grid(row=4, column=0, sticky="ew")
-        for c, w in enumerate([160, 200, 360]): btns.grid_columnconfigure(c, minsize=w)
+        btns.grid(row=5, column=0, sticky="ew")  # was row=4
+        for c, w in enumerate([160, 160, 160, 360]): btns.grid_columnconfigure(c, minsize=w)
         self.start_btn = ttk.Button(btns, text="Start", command=self.start_sim, state="disabled")
+        self.pause_btn = ttk.Button(btns, text="Pause", command=self.toggle_pause, state="disabled")
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop_sim, state="disabled")
         self.apply_btn = ttk.Button(btns, text="Apply to running (reset)", command=self.apply_to_running, state="disabled")
         self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(4, 4))
-        self.apply_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.pause_btn.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        self.stop_btn.grid(row=0, column=2, sticky="ew", padx=(4, 4))
+        self.apply_btn.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         # ==== TX Monitor ====
         monitor = ttk.LabelFrame(root, text="TX Monitor (latest)", padding=8)
-        monitor.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        monitor.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))  # was row=5
         monitor.grid_columnconfigure(0, weight=1)
 
         # UBX
@@ -909,7 +975,6 @@ class SimulatorGUI:
         self.refresh_ports()
         self._update_start_btn_state()
         self._rebuild_tx_tables()
-
         # Queue drainers
         self.root.after(120, self._drain_rate_queue)
         self.root.after(30,  self._drain_profile_queue)  # 30ms is fine for direct updates
@@ -950,6 +1015,36 @@ class SimulatorGUI:
         self.nmea_menu.tk_popup(event.x_root, event.y_root)
 
     # ---------- Copy helpers ----------
+    def _parse_int_str(self, s: str) -> int:
+        s = "" if s is None else str(s).strip().replace(",", ".")
+        try:
+            v = int(float(s))
+        except ValueError:
+            v = 0
+        return max(0, v)
+    # --- Effective offset logic (mirror main.cpp getEffectiveCalibrationOffset) ---
+    def _effective_offset_from_kmh(self, kmh: float, raw_offset: int) -> int:
+        """
+        Piecewise calibration:
+        <20 km/h  -> raw - 3
+        20..40    -> raw - 2
+        40..60    -> raw - 1
+        >=60      -> raw
+        Clamp [0..5]
+        """
+        if kmh is None:
+            return max(0, min(5, raw_offset))
+        eff = raw_offset
+        if kmh < 20.0:
+            eff = raw_offset - 3
+        elif kmh < 40.0:
+            eff = raw_offset - 2
+        elif kmh < 60.0:
+            eff = raw_offset - 1
+        # else: raw
+        if eff < 0: eff = 0
+        if eff > 5: eff = 5
+        return eff
     def _copy_selected_ubx(self):
         sel = self.ubx_tree.selection()
         if not sel: return
@@ -1041,6 +1136,8 @@ class SimulatorGUI:
         self.lbl_lat.config(text="Lat: —")
         self.lbl_lon.config(text="Lon: —")
         self.active_prof_value.config(text="—")
+        if self.lbl_pkt_totals is not None:
+            self.lbl_pkt_totals.config(text=self._totals_blank_text)
 
         # Clear current TX values
         for iid in self.ubx_tree.get_children():
@@ -1184,6 +1281,8 @@ class SimulatorGUI:
                             lbl.config(text=(f"act: {rates.get(key, 0.0):.2f} Hz" if var.get() and self.nmea_master_var.get() else ""))
         except queue.Empty:
             pass
+        if self.paused: 
+            pass
         self.root.after(120, self._drain_rate_queue)
 
     def _drain_profile_queue(self):
@@ -1228,7 +1327,8 @@ class SimulatorGUI:
         try:
             while True:
                 s = self.stats_queue.get_nowait()
-                if not self.sim_running: continue
+                if not self.sim_running:
+                    continue
                 prof = self._current_profile_name
                 if prof == "GPS_DISABLE":
                     und = self.UND
@@ -1261,7 +1361,6 @@ class SimulatorGUI:
                 else:
                     self._reset_status_area_basecolor()
                     fx = int(s.get("fix", 0))
-                    self.lbl_speed_big.config(text=f"Speed: {s.get('speed', 0.0):.1f} km/h")
                     self.lbl_time_utc.config(text=f"Time (UTC): {s.get('utc', '—')}")
                     self.lbl_time_loc.config(text=f"Time (Local): {s.get('local', '—')}")
                     self.lbl_heading.config(text=f"Heading: {s.get('heading', 0.0):.1f}°")
@@ -1278,21 +1377,122 @@ class SimulatorGUI:
             pass
         self.root.after(120, self._drain_stats_queue)
 
+    def _parse_nav_pvt_kmh(self, ubx_hex: str):
+        """Return speed in km/h parsed from UBX-NAV-PVT (current packet only)."""
+        try:
+            b = bytes.fromhex(ubx_hex)
+            if len(b) < 8:  # header + len
+                return None
+            if b[0] != 0xB5 or b[1] != 0x62:
+                return None
+            if b[2] != 0x01 or b[3] != 0x07:  # NAV-PVT
+                return None
+            plen = int.from_bytes(b[4:6], "little")
+            if len(b) < 6 + plen + 2:
+                return None
+            payload = b[6:6+plen]
+            # Simulator's builder order: gSpeed at payload offset 60 (int32, mm/s)
+            if len(payload) < 64:
+                return None
+            gspeed_mms = int.from_bytes(payload[60:64], "little", signed=True)
+            kmh = max(0.0, (gspeed_mms / 1000.0) * 3.6)
+            return kmh
+        except Exception:
+            return None
+
+    def _parse_vtg_kmh(self, sentence: str):
+        """Return speed in km/h from NMEA VTG (..,K field)."""
+        try:
+            s = sentence.strip()
+            if not s.startswith("$") or "*" not in s:
+                return None
+            core = s[1:s.index("*")]
+            parts = core.split(",")
+            if not parts or parts[0][-3:].upper() != "VTG":
+                return None
+            # VTG: ... , <spd_knots>, 'N', <spd_kmh>, 'K', mode
+            # find the 'K' token and read the number just before it
+            for i, tok in enumerate(parts):
+                if tok.upper() == "K" and i > 0:
+                    return float(parts[i-1])
+            return None
+        except Exception:
+            return None
+
+    def _parse_rmc_kmh(self, sentence: str):
+        """Return speed in km/h from NMEA RMC (speed over ground in knots -> km/h)."""
+        try:
+            s = sentence.strip()
+            if not s.startswith("$") or "*" not in s:
+                return None
+            core = s[1:s.index("*")]
+            parts = core.split(",")
+            if not parts or parts[0][-3:].upper() != "RMC":
+                return None
+            # RMC fields: ... , spd_knots (index 7), ...
+            if len(parts) > 7 and parts[7]:
+                knots = float(parts[7])
+                return knots * 1.852  # 1 knot = 1.852 km/h
+            return None
+        except Exception:
+            return None
+
     def _drain_tx_queue(self):
         try:
             while True:
-                nmea_map, ubx_map = self.tx_queue.get_nowait()
+                nmea_map, ubx_map, totals = self.tx_queue.get_nowait()
                 if not self.sim_running: continue
                 # UBX (hex + computed byte length)
                 for key, label in (("pvt","UBX-NAV-PVT"), ("velned","UBX-NAV-VELNED"), ("sol","UBX-NAV-SOL")):
                     if key in ubx_map and key in self.ubx_tree.get_children():
                         hexstr = ubx_map[key]; bytelen = len(hexstr) // 2
                         self.ubx_tree.item(key, values=(label, str(bytelen), hexstr))
+
+                        if key == "pvt":
+                            kmh = self._parse_nav_pvt_kmh(hexstr)
+                            if kmh is not None and self._current_profile_name not in ("NO_FIX", "GPS_DISABLE"):
+                                # Update Speed & last3 immediately (current packet)
+                                # When got kmh from PVT/VTG/RMC:
+                                self._last_speed_kmh = float(kmh)  # cache last real speed
+                                raw = self._parse_int_str(self.calib_var.get())
+                                eff = self._effective_offset_from_kmh(self._last_speed_kmh, raw)
+                                disp = max(0.0, self._last_speed_kmh + eff)
+                                self.lbl_speed_big.config(
+                                    text=f"Speed: {self._last_speed_kmh:.1f} kmh.    Display speed {disp:.1f} kmh"
+                                )
+
+                                # Update Effective offset label (this is the missing part)
+                                self.lbl_eff_offset.config(text=f"Effective offset: {eff} kmh")
+                # Update totals line every time we get a TX tick
+                if isinstance(totals, dict) and self.lbl_pkt_totals is not None:
+                    # show only keys with >0 counts, ordered by a stable list
+                    order = ["pvt","velned","sol","gga","gll","gsa","gsv","rmc","vtg"]
+                    parts = [f"{k}:{totals.get(k,0)}" for k in order if totals.get(k,0) > 0]
+                    txt = self._totals_blank_text if not parts else ("Packets total: " + ", ".join(parts))
+                    self.lbl_pkt_totals.config(text=txt)
                 # NMEA (text)
                 for key, label in (("gga","NMEA GGA"), ("gll","NMEA GLL"), ("gsa","NMEA GSA"),
-                                   ("gsv","NMEA GSV"), ("rmc","NMEA RMC"), ("vtg","NMEA VTG")):
+                                ("gsv","NMEA GSV"), ("rmc","NMEA RMC"), ("vtg","NMEA VTG")):
                     if key in nmea_map and key in self.nmea_tree.get_children():
-                        self.nmea_tree.item(key, values=(label, nmea_map[key]))
+                        sentence = nmea_map[key]
+                        self.nmea_tree.item(key, values=(label, sentence))
+
+                        # NEW: If VTG/RMC arrives, allow updating Speed from the current sentence
+                        if self._current_profile_name not in ("NO_FIX", "GPS_DISABLE"):
+                            kmh = None
+                            if key == "vtg":
+                                kmh = self._parse_vtg_kmh(sentence)
+                            elif key == "rmc":
+                                kmh = self._parse_rmc_kmh(sentence)
+                            if kmh is not None:
+                                # When got kmh from PVT/VTG/RMC:
+                                self._last_speed_kmh = float(kmh)  # cache last real speed
+                                raw = self._parse_int_str(self.calib_var.get())
+                                eff = self._effective_offset_from_kmh(self._last_speed_kmh, raw)
+                                disp = max(0.0, self._last_speed_kmh + eff)
+                                self.lbl_speed_big.config(text=f"Speed: {self._last_speed_kmh:.1f} kmh.    Display speed {disp:.1f} kmh")
+                                # also refresh the Effective offset label near the spinbox
+                                self.lbl_eff_offset.config(text=f"Effective offset: {eff} kmh")
         except queue.Empty:
             pass
         self.root.after(80, self._drain_tx_queue)
@@ -1316,7 +1516,9 @@ class SimulatorGUI:
 
         def worker():
             try:
-                sim = UbxNmeaSimulator(cfg, self.ctrl_queue, rate_cb, prof_cb, stats_cb, tx_cb, self.stop_event)
+                # NOTE: tx_cb now accepts (nmea_map, ubx_map, totals_dict)
+                def _tx_cb(n, u, t): self.tx_queue.put((n, u, t))
+                sim = UbxNmeaSimulator(cfg, self.ctrl_queue, rate_cb, prof_cb, stats_cb, _tx_cb, self.stop_event)
                 sim.run()
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -1327,11 +1529,83 @@ class SimulatorGUI:
         self._last_applied_config = cfg
         self._mark_dirty(False)
         self._toggle_inputs(True)
+        # Reset pause state on start
+        self.paused = False
+        self.pause_btn.configure(text=self._pause_label_cache[0])
         self._auto_resize_to_fit()
 
     def stop_sim(self):
         if not self.sim_running: return
         self.stop_event.set()  # snapshot remains visible
+
+        # UI-side reset for totals line (new Start will recreate worker with zeroed totals)
+        try:
+            if self.lbl_pkt_totals is not None:
+                self.lbl_pkt_totals.config(text=self._totals_blank_text)
+        except Exception:
+            pass
+
+    # Pause/Resume toggle: ensure we display the latest stats just before pausing
+    def toggle_pause(self):
+        if not self.sim_running:
+            return
+        if not self.paused:
+            # Drain queues để “đóng băng” UI ở trạng thái mới nhất
+            self._drain_all_queues_once()
+            self.paused = True
+            try:
+                self.pause_btn.configure(text=self._pause_label_cache[1])
+            except Exception:
+                pass
+            # NEW: thông báo worker dừng sinh dữ liệu
+            try:
+                self.ctrl_queue.put_nowait({"cmd": "pause", "value": True})
+            except Exception:
+                pass
+        else:
+            self.paused = False
+            try:
+                self.pause_btn.configure(text=self._pause_label_cache[0])
+            except Exception:
+                pass
+            # NEW: thông báo worker tiếp tục
+            try:
+                self.ctrl_queue.put_nowait({"cmd": "pause", "value": False})
+            except Exception:
+                pass
+
+    # Internal helper: drain each queue synchronously exactly once (no reschedule)
+    def _drain_all_queues_once(self):
+        # Rate
+        try:
+            while True:
+                rates = self.rate_queue.get_nowait()
+                # mimic _drain_rate_queue body (UI labels update)
+                self.pvt_rate.config(text=(f"act: {rates.get('pvt', 0.0):.2f} Hz"     if self.pvt_var.get()   and self.ubx_master_var.get() else ""))
+                self.vel_rate.config(text=(f"act: {rates.get('velned', 0.0):.2f} Hz"  if self.vel_var.get()   and self.ubx_master_var.get() else ""))
+                self.sol_rate.config(text=(f"act: {rates.get('sol', 0.0):.2f} Hz"     if self.sol_var.get()   and self.ubx_master_var.get() else ""))
+                for key in ("gga","gll","gsa","gsv","rmc","vtg"):
+                    lbl, var = self.nmea_rate_labels.get(key), self.nmea_vars.get(key)
+                    if lbl is not None and var is not None:
+                        lbl.config(text=(f"act: {rates.get(key, 0.0):.2f} Hz" if var.get() and self.nmea_master_var.get() else ""))
+        except queue.Empty:
+            pass
+        # Profile
+        try:
+            while True:
+                info = self.profile_queue.get_nowait()
+                self._current_is_lost = bool(info.get("is_lost", False))
+                self._current_profile_name = info.get("name", "—")
+                self.active_prof_value.config(text=self._current_profile_name)
+                p = float(info.get("progress", 0.0))
+                self.active_prog["value"] = int(max(0.0, min(1.0, p)) * 1000)
+        except queue.Empty:
+            pass
+        # Stats
+        self._drain_stats_queue()  # will consume everything pending and update labels
+        # TX
+        self._drain_tx_queue()     # will consume pending TX once
+
 
     def apply_to_running(self):
         if not self.sim_running or not self._dirty: return
@@ -1350,10 +1624,13 @@ class SimulatorGUI:
     def _toggle_inputs(self, running: bool):
         self.sim_running = running
         self.start_btn.configure(state=("disabled" if running else ("normal" if self._has_any_message_selected() and self._current_config(validate_messages=False) else "disabled")))
+        self.pause_btn.configure(state=("normal" if running else "disabled"))
         self.stop_btn.configure(state=("normal" if running else "disabled"))
         self.apply_btn.configure(state=("normal" if (running and self._dirty) else "disabled"))
         self.port_cb.configure(state=("disabled" if running else "readonly"))
         self.baud_cb.configure(state=("disabled" if running else ("readonly" if self.port_var.get() else "disabled")))
+        # When stopping, ensure Pause label resets
+        if not running: self.pause_btn.configure(text=self._pause_label_cache[0])
 
     def on_close(self):
         try:
