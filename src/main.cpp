@@ -41,8 +41,8 @@ static const uint32_t TARGET_BAUD = 115200;
 // 2) PINS & RUNTIME IDs
 /////////////////////
 
-static const uint8_t PIN_RXD2 = 16; // GPS TX -> RXD2
-static const uint8_t PIN_TXD2 = 17; // GPS RX -> TXD2
+static const uint8_t PIN_RXD2 = 26; // GPS TX -> RXD2
+static const uint8_t PIN_TXD2 = 27; // GPS RX -> TXD2
 static const int PIN_BUTTON = 32;
 
 static int coreIdGps = -1;
